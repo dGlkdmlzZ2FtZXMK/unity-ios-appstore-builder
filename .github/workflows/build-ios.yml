@@ -1,4 +1,4 @@
-name: Build Fortellervegg iOS
+name: Build iOS → App Store Connect
 
 on:
   workflow_dispatch:
