@@ -1,107 +1,393 @@
 name: Build iOS → App Store Connect
 
+run-name: "${{ inputs.app }} • ${{ inputs.request_id }}"
+
 on:
   workflow_dispatch:
+    inputs:
+
+      app:
+        description: App environment
+        required: true
+        type: environment
+
+      asset_name:
+        description: Exact ZIP asset name from the ios-inputs release
+        required: true
+        type: string
+
+      sha256:
+        description: Expected SHA-256 of the uploaded ZIP
+        required: true
+        type: string
+
+      request_id:
+        description: Unique publisher request ID
+        required: true
+        type: string
+
+
+# ----------------------------------------------------------------
+# Only one build of a given app may run at once.
+#
+# Fortellervegg and HFDU can still build simultaneously because
+# their concurrency groups are different.
+# ----------------------------------------------------------------
+
+concurrency:
+  group: appstore-${{ inputs.app }}
+  cancel-in-progress: false
+
 
 permissions:
   contents: read
 
+
 jobs:
+
   build-ios:
+
+    name: Build ${{ inputs.app }}
+
     runs-on: macos-26
+
+    environment:
+      name: ${{ inputs.app }}
+
+    env:
+
+      # ------------------------------------------------------------
+      # App-specific configuration.
+      #
+      # These come from the selected GitHub Environment:
+      #
+      # fortellervegg
+      # hfdu
+      # etc.
+      # ------------------------------------------------------------
+
+      APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME }}
+      EXPECTED_BUNDLE_ID: ${{ vars.EXPECTED_BUNDLE_ID }}
+      XCODE_SCHEME: ${{ vars.XCODE_SCHEME }}
+
+      # ------------------------------------------------------------
+      # Request information supplied by the Windows publisher.
+      # ------------------------------------------------------------
+
+      INPUT_ASSET_NAME: ${{ inputs.asset_name }}
+      INPUT_SHA256: ${{ inputs.sha256 }}
+      REQUEST_ID: ${{ inputs.request_id }}
+
 
     steps:
 
       # ============================================================
-      # 1. Select Xcode
+      # 1. Validate workflow configuration
+      #
+      # Fail immediately if an environment or repository secret
+      # hasn't been configured correctly.
+      # ============================================================
+
+      - name: Validate configuration
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "=========================================="
+          echo "Unity iOS App Store Builder"
+          echo "=========================================="
+          echo ""
+          echo "App:        $APP_DISPLAY_NAME"
+          echo "Bundle ID:  $EXPECTED_BUNDLE_ID"
+          echo "Scheme:     $XCODE_SCHEME"
+          echo "Request:    $REQUEST_ID"
+          echo "Input:      $INPUT_ASSET_NAME"
+          echo ""
+
+          FAILED=0
+
+          check_value()
+          {
+              NAME="$1"
+              VALUE="$2"
+
+              if [ -z "$VALUE" ]; then
+                  echo "::error::$NAME is not configured."
+                  FAILED=1
+              else
+                  echo "✓ $NAME"
+              fi
+          }
+
+          check_value "APP_DISPLAY_NAME" "$APP_DISPLAY_NAME"
+          check_value "EXPECTED_BUNDLE_ID" "$EXPECTED_BUNDLE_ID"
+          check_value "XCODE_SCHEME" "$XCODE_SCHEME"
+
+          check_value "APPLE_TEAM_ID" "$APPLE_TEAM_ID"
+          check_value "ASC_KEY_ID" "$ASC_KEY_ID"
+          check_value "ASC_ISSUER_ID" "$ASC_ISSUER_ID"
+          check_value "ASC_PRIVATE_KEY_BASE64" "$ASC_PRIVATE_KEY_BASE64"
+
+          echo ""
+
+          if ! [[ "$REQUEST_ID" =~ ^[A-Za-z0-9_-]{4,64}$ ]]; then
+              echo "::error::Invalid request_id."
+              FAILED=1
+          else
+              echo "✓ Request ID format"
+          fi
+
+          if ! [[ "$INPUT_ASSET_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.zip$ ]]; then
+              echo "::error::Invalid asset filename."
+              FAILED=1
+          else
+              echo "✓ Asset filename format"
+          fi
+
+          if ! [[ "$INPUT_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+              echo "::error::Invalid SHA-256 value."
+              FAILED=1
+          else
+              echo "✓ SHA-256 format"
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+              echo ""
+              echo "::error::Configuration validation failed."
+              exit 1
+          fi
+
+          echo ""
+          echo "Configuration valid."
+
+
+      # ============================================================
+      # 2. Select Xcode
+      #
+      # We deliberately pin the Xcode version rather than accepting
+      # whatever GitHub currently marks as default.
       # ============================================================
 
       - name: Select Xcode 26.6
         run: |
-          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          set -Eeuo pipefail
 
-          echo "Using Xcode:"
+          XCODE_PATH="/Applications/Xcode_26.6.app"
+
+          if [ ! -d "$XCODE_PATH" ]; then
+
+              echo "::error::Xcode 26.6 was not found."
+              echo ""
+              echo "Available Xcode installations:"
+              ls -1 /Applications | grep '^Xcode' || true
+
+              exit 1
+
+          fi
+
+          sudo xcode-select \
+              -s "$XCODE_PATH/Contents/Developer"
+
+          echo "Xcode:"
           xcodebuild -version
 
-          echo "Using iOS SDK:"
+          echo ""
+          echo "iOS SDK:"
           xcrun --sdk iphoneos --show-sdk-version
 
 
       # ============================================================
-      # 2. Download the Unity-generated iOS/Xcode project
+      # 3. Download the exact Unity-generated ZIP
       #
-      # Expected GitHub Release:
+      # Release:
+      #   ios-inputs
       #
-      #   Tag:
-      #       ios-input
-      #
-      #   Asset:
-      #       Fortellervegg-iOS.zip
-      #
-      # The ZIP should contain Unity-iPhone.xcodeproj directly
-      # at its root.
+      # The asset filename is unique to this publishing request.
       # ============================================================
 
-      - name: Download Unity iOS export
+      - name: Download Unity iOS package
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$RUNNER_TEMP/input"
+          set -Eeuo pipefail
 
-          gh release download ios-input \
-            --repo "${{ github.repository }}" \
-            --pattern "Fortellervegg-iOS.zip" \
-            --dir "$RUNNER_TEMP/input"
+          INPUT_DIR="$RUNNER_TEMP/input"
 
-          echo "Downloaded files:"
-          ls -lah "$RUNNER_TEMP/input"
+          mkdir -p "$INPUT_DIR"
 
+          echo "Downloading:"
+          echo "$INPUT_ASSET_NAME"
+          echo ""
 
-      # ============================================================
-      # 3. Extract the Unity iOS project
-      # ============================================================
+          gh release download ios-inputs \
+              --repo "${{ github.repository }}" \
+              --pattern "$INPUT_ASSET_NAME" \
+              --dir "$INPUT_DIR"
 
-      - name: Extract Unity iOS export
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/ios-project"
+          ZIP_PATH="$INPUT_DIR/$INPUT_ASSET_NAME"
 
-          ditto -x -k \
-            "$RUNNER_TEMP/input/Fortellervegg-iOS.zip" \
-            "$GITHUB_WORKSPACE/ios-project"
-
-          echo "Extracted contents:"
-          ls -lah "$GITHUB_WORKSPACE/ios-project"
-
-          if [ ! -d "$GITHUB_WORKSPACE/ios-project/Unity-iPhone.xcodeproj" ]; then
-            echo ""
-            echo "ERROR: Unity-iPhone.xcodeproj was not found."
-            echo ""
-            echo "The ZIP must contain the contents of the Unity iOS"
-            echo "build folder directly, rather than another wrapper folder."
-            echo ""
-            echo "Extracted tree:"
-            find "$GITHUB_WORKSPACE/ios-project" -maxdepth 3 -print
-            exit 1
+          if [ ! -f "$ZIP_PATH" ]; then
+              echo "::error::Requested build package was not downloaded."
+              exit 1
           fi
 
+          echo ""
+          echo "Downloaded:"
+          ls -lh "$ZIP_PATH"
+
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+
 
       # ============================================================
-      # 4. Install App Store Connect API key
+      # 4. Verify package checksum
       #
-      # Required GitHub Secrets:
+      # Windows calculates SHA-256 before uploading.
+      # The Mac independently calculates it again after downloading.
+      # ============================================================
+
+      - name: Verify package SHA-256
+        run: |
+          set -Eeuo pipefail
+
+          EXPECTED_SHA=$(echo "$INPUT_SHA256" | tr '[:upper:]' '[:lower:]')
+
+          ACTUAL_SHA=$(
+              shasum -a 256 "$ZIP_PATH" |
+              awk '{print $1}' |
+              tr '[:upper:]' '[:lower:]'
+          )
+
+          echo "Expected:"
+          echo "$EXPECTED_SHA"
+
+          echo ""
+          echo "Received:"
+          echo "$ACTUAL_SHA"
+
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+
+              echo ""
+              echo "::error::SHA-256 mismatch."
+              echo "::error::The downloaded build package is not the package that was dispatched."
+
+              exit 1
+
+          fi
+
+          echo ""
+          echo "✓ Package checksum verified."
+
+
+      # ============================================================
+      # 5. Inspect ZIP for unsafe paths
       #
-      #   APPLE_TEAM_ID
-      #   ASC_KEY_ID
-      #   ASC_ISSUER_ID
-      #   ASC_PRIVATE_KEY_BASE64
+      # Refuse absolute paths or ../ traversal before extraction.
+      # ============================================================
+
+      - name: Validate ZIP structure
+        run: |
+          set -Eeuo pipefail
+
+          export ZIP_PATH
+
+          python3 <<'PY'
+          import os
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
+
+          zip_path = os.environ["ZIP_PATH"]
+
+          try:
+              archive = zipfile.ZipFile(zip_path)
+          except zipfile.BadZipFile:
+              print("::error::Input file is not a valid ZIP archive.")
+              sys.exit(1)
+
+          entries = archive.infolist()
+
+          if not entries:
+              print("::error::ZIP archive is empty.")
+              sys.exit(1)
+
+          for entry in entries:
+              name = entry.filename.replace("\\", "/")
+              path = PurePosixPath(name)
+
+              if path.is_absolute() or ".." in path.parts:
+                  print(f"::error::Unsafe ZIP path detected: {name}")
+                  sys.exit(1)
+
+          print(f"✓ ZIP structure validated ({len(entries)} entries).")
+          PY
+
+
+      # ============================================================
+      # 6. Extract Unity-generated Xcode project
       #
-      # The key is installed in:
+      # The ZIP must contain the CONTENTS of the Unity iOS build
+      # directory directly.
       #
-      #   RUNNER_TEMP
-      #       Used explicitly by xcodebuild
+      # Correct:
       #
-      #   ~/.appstoreconnect/private_keys/
-      #       Used automatically by altool
+      # ZIP
+      # ├─ Unity-iPhone.xcodeproj
+      # ├─ Classes
+      # ├─ Data
+      # └─ ...
+      #
+      # Incorrect:
+      #
+      # ZIP
+      # └─ Fortellervegg-iOS
+      #    ├─ Unity-iPhone.xcodeproj
+      #    └─ ...
+      # ============================================================
+
+      - name: Extract Unity iOS project
+        run: |
+          set -Eeuo pipefail
+
+          IOS_PROJECT="$GITHUB_WORKSPACE/ios-project"
+
+          mkdir -p "$IOS_PROJECT"
+
+          ditto \
+              -x \
+              -k \
+              "$ZIP_PATH" \
+              "$IOS_PROJECT"
+
+          echo "Extracted root:"
+          ls -lah "$IOS_PROJECT"
+
+          if [ ! -d "$IOS_PROJECT/Unity-iPhone.xcodeproj" ]; then
+
+              echo ""
+              echo "::error::Unity-iPhone.xcodeproj was not found at the root of the ZIP."
+              echo ""
+              echo "Extracted structure:"
+              find "$IOS_PROJECT" -maxdepth 3 -print | head -200
+
+              exit 1
+
+          fi
+
+          echo ""
+          echo "✓ Unity Xcode project found."
+
+
+      # ============================================================
+      # 7. Install the App Store Connect API key
+      #
+      # The temporary copy is passed explicitly to xcodebuild.
+      #
+      # A second copy is put in Apple's conventional private-key
+      # directory for altool.
       # ============================================================
 
       - name: Install App Store Connect API key
@@ -109,182 +395,426 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
         run: |
-          TEMP_KEY_DIR="$RUNNER_TEMP/appstore-key"
-          TEMP_KEY_PATH="$TEMP_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          set -Eeuo pipefail
 
-          mkdir -p "$TEMP_KEY_DIR"
+          KEY_DIR="$RUNNER_TEMP/appstore-key"
+          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
 
-          echo "$ASC_PRIVATE_KEY_BASE64" \
-            | base64 -D \
-            > "$TEMP_KEY_PATH"
+          mkdir -p "$KEY_DIR"
 
-          chmod 600 "$TEMP_KEY_PATH"
+          echo "$ASC_PRIVATE_KEY_BASE64" |
+              base64 -D \
+              > "$KEY_PATH"
 
-          echo "ASC_KEY_PATH=$TEMP_KEY_PATH" >> "$GITHUB_ENV"
+          if [ ! -s "$KEY_PATH" ]; then
+              echo "::error::App Store Connect private key could not be restored."
+              exit 1
+          fi
+
+          chmod 600 "$KEY_PATH"
+
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          echo "API_PRIVATE_KEYS_DIR=$KEY_DIR" >> "$GITHUB_ENV"
 
           ALTOOL_KEY_DIR="$HOME/.appstoreconnect/private_keys"
 
           mkdir -p "$ALTOOL_KEY_DIR"
 
-          cp "$TEMP_KEY_PATH" \
-            "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          cp \
+              "$KEY_PATH" \
+              "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
 
           chmod 600 \
-            "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+              "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
 
-          echo "App Store Connect API key installed."
+          echo "✓ App Store Connect API key installed."
 
 
       # ============================================================
-      # 5. CocoaPods
-      #
-      # Some Unity plugins may generate a Podfile.
-      # If there is no Podfile, nothing happens here.
+      # 8. Install CocoaPods dependencies when required
       # ============================================================
 
       - name: Install CocoaPods dependencies
         working-directory: ios-project
         run: |
-          if [ -f "Podfile" ]; then
+          set -Eeuo pipefail
 
-            echo "Podfile found."
+          if [ ! -f "Podfile" ]; then
 
-            if [ -f "Podfile.lock" ]; then
+              echo "No Podfile found."
+              echo "✓ CocoaPods not required."
+
+              exit 0
+
+          fi
+
+          echo "Podfile found."
+
+          pod --version
+
+          echo ""
+
+          if [ -f "Podfile.lock" ]; then
+
               echo "Podfile.lock found."
+              echo "Installing locked dependencies..."
+
               pod install --deployment
-            else
-              echo "No Podfile.lock found."
-              pod install
-            fi
 
           else
-            echo "No Podfile found - skipping CocoaPods."
+
+              echo "No Podfile.lock found."
+              echo "Resolving dependencies..."
+
+              pod install
+
           fi
+
+          echo ""
+          echo "✓ CocoaPods dependencies installed."
 
 
       # ============================================================
-      # 6. Determine whether to build .xcworkspace or .xcodeproj
+      # 9. Determine whether this project uses .xcworkspace
       #
-      # If CocoaPods created a workspace, use that.
-      # Otherwise use Unity-iPhone.xcodeproj.
+      # CocoaPods normally creates Unity-iPhone.xcworkspace.
       # ============================================================
 
       - name: Determine Xcode build container
         working-directory: ios-project
         run: |
+          set -Eeuo pipefail
+
           if [ -d "Unity-iPhone.xcworkspace" ]; then
 
-            echo "Using Unity-iPhone.xcworkspace"
+              echo "Using:"
+              echo "Unity-iPhone.xcworkspace"
 
-            echo "XCODE_CONTAINER_TYPE=workspace" >> "$GITHUB_ENV"
-            echo "XCODE_CONTAINER=Unity-iPhone.xcworkspace" >> "$GITHUB_ENV"
+              echo "XCODE_CONTAINER_TYPE=workspace" >> "$GITHUB_ENV"
+              echo "XCODE_CONTAINER=Unity-iPhone.xcworkspace" >> "$GITHUB_ENV"
 
           else
 
-            echo "Using Unity-iPhone.xcodeproj"
+              echo "Using:"
+              echo "Unity-iPhone.xcodeproj"
 
-            echo "XCODE_CONTAINER_TYPE=project" >> "$GITHUB_ENV"
-            echo "XCODE_CONTAINER=Unity-iPhone.xcodeproj" >> "$GITHUB_ENV"
+              echo "XCODE_CONTAINER_TYPE=project" >> "$GITHUB_ENV"
+              echo "XCODE_CONTAINER=Unity-iPhone.xcodeproj" >> "$GITHUB_ENV"
 
           fi
 
 
       # ============================================================
-      # 7. Show available Xcode schemes
-      #
-      # Mainly diagnostic. If the build configuration changes later,
-      # this makes failures much easier to understand.
+      # 10. Verify that the configured scheme actually exists
       # ============================================================
 
-      - name: Show Xcode schemes
+      - name: Verify Xcode scheme
         working-directory: ios-project
         run: |
+          set -Eeuo pipefail
+
+          SCHEME_JSON="$RUNNER_TEMP/xcode-schemes.json"
+
           if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
 
-            xcodebuild \
-              -workspace "$XCODE_CONTAINER" \
-              -list
+              xcodebuild \
+                  -workspace "$XCODE_CONTAINER" \
+                  -list \
+                  -json \
+                  > "$SCHEME_JSON"
 
           else
 
-            xcodebuild \
-              -project "$XCODE_CONTAINER" \
-              -list
+              xcodebuild \
+                  -project "$XCODE_CONTAINER" \
+                  -list \
+                  -json \
+                  > "$SCHEME_JSON"
 
           fi
 
+          export SCHEME_JSON
+          export XCODE_SCHEME
+
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(os.environ["SCHEME_JSON"], "r", encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          container = data.get("workspace") or data.get("project") or {}
+          schemes = container.get("schemes", [])
+
+          expected = os.environ["XCODE_SCHEME"]
+
+          print("Available schemes:")
+
+          for scheme in schemes:
+              print(f"  - {scheme}")
+
+          print()
+
+          if expected not in schemes:
+              print(f"::error::Configured Xcode scheme '{expected}' was not found.")
+              sys.exit(1)
+
+          print(f"✓ Scheme verified: {expected}")
+          PY
+
 
       # ============================================================
-      # 8. Archive Fortellervegg
+      # 11. Verify bundle identifier
       #
-      # Uses automatic Apple signing.
+      # This independently confirms that the package dispatched as
+      # a particular app actually contains that app's bundle ID.
       #
-      # The App Store Connect API key allows Xcode to communicate
-      # with Apple's provisioning/signing services.
+      # This check occurs BEFORE signing or uploading anything.
       # ============================================================
 
-      - name: Archive Fortellervegg
+      - name: Verify app identity
+        working-directory: ios-project
+        run: |
+          set -Eeuo pipefail
+
+          SETTINGS_FILE="$RUNNER_TEMP/build-settings.txt"
+
+          if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
+
+              xcodebuild \
+                  -workspace "$XCODE_CONTAINER" \
+                  -scheme "$XCODE_SCHEME" \
+                  -configuration Release \
+                  -destination "generic/platform=iOS" \
+                  -showBuildSettings \
+                  > "$SETTINGS_FILE"
+
+          else
+
+              xcodebuild \
+                  -project "$XCODE_CONTAINER" \
+                  -scheme "$XCODE_SCHEME" \
+                  -configuration Release \
+                  -destination "generic/platform=iOS" \
+                  -showBuildSettings \
+                  > "$SETTINGS_FILE"
+
+          fi
+
+          echo "Bundle identifiers found in scheme:"
+          echo ""
+
+          BUNDLE_IDS=$(
+              sed -n \
+                  's/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = //p' \
+                  "$SETTINGS_FILE" |
+              sort -u
+          )
+
+          if [ -z "$BUNDLE_IDS" ]; then
+
+              echo "::error::No PRODUCT_BUNDLE_IDENTIFIER could be determined."
+              exit 1
+
+          fi
+
+          echo "$BUNDLE_IDS" |
+              sed 's/^/  /'
+
+          echo ""
+
+          if ! echo "$BUNDLE_IDS" |
+              grep -Fqx "$EXPECTED_BUNDLE_ID"; then
+
+              echo "::error::Bundle identifier mismatch."
+              echo ""
+              echo "Expected:"
+              echo "  $EXPECTED_BUNDLE_ID"
+              echo ""
+              echo "The selected GitHub Environment does not match this Unity iOS build."
+
+              exit 1
+
+          fi
+
+          echo "✓ App identity verified."
+          echo ""
+          echo "App:"
+          echo "  $APP_DISPLAY_NAME"
+          echo ""
+          echo "Bundle:"
+          echo "  $EXPECTED_BUNDLE_ID"
+
+
+      # ============================================================
+      # 12. Prepare build log directory
+      # ============================================================
+
+      - name: Prepare build logs
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+
+
+      # ============================================================
+      # 13. Archive the application
+      #
+      # Xcode communicates with Apple's provisioning/signing service
+      # using the shared App Store Connect API key.
+      # ============================================================
+
+      - name: Archive iOS app
         working-directory: ios-project
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
-          ARCHIVE_PATH="$RUNNER_TEMP/Fortellervegg.xcarchive"
+          set -Eeuo pipefail
+
+          ARCHIVE_PATH="$RUNNER_TEMP/AppStore-${REQUEST_ID}.xcarchive"
+
+          echo "=========================================="
+          echo "Archiving"
+          echo "=========================================="
+          echo ""
+          echo "$APP_DISPLAY_NAME"
+          echo "$EXPECTED_BUNDLE_ID"
+          echo ""
 
           if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
 
-            xcodebuild \
-              -workspace "$XCODE_CONTAINER" \
-              -scheme "Unity-iPhone" \
-              -configuration Release \
-              -destination "generic/platform=iOS" \
-              -archivePath "$ARCHIVE_PATH" \
-              -allowProvisioningUpdates \
-              -authenticationKeyPath "$ASC_KEY_PATH" \
-              -authenticationKeyID "$ASC_KEY_ID" \
-              -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-              DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-              CODE_SIGN_STYLE=Automatic \
-              clean archive
+              xcodebuild \
+                  -workspace "$XCODE_CONTAINER" \
+                  -scheme "$XCODE_SCHEME" \
+                  -configuration Release \
+                  -destination "generic/platform=iOS" \
+                  -archivePath "$ARCHIVE_PATH" \
+                  -allowProvisioningUpdates \
+                  -authenticationKeyPath "$ASC_KEY_PATH" \
+                  -authenticationKeyID "$ASC_KEY_ID" \
+                  -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+                  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+                  CODE_SIGN_STYLE=Automatic \
+                  clean archive \
+                  2>&1 |
+                  tee "$GITHUB_WORKSPACE/logs/archive.log"
 
           else
 
-            xcodebuild \
-              -project "$XCODE_CONTAINER" \
-              -scheme "Unity-iPhone" \
-              -configuration Release \
-              -destination "generic/platform=iOS" \
-              -archivePath "$ARCHIVE_PATH" \
-              -allowProvisioningUpdates \
-              -authenticationKeyPath "$ASC_KEY_PATH" \
-              -authenticationKeyID "$ASC_KEY_ID" \
-              -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-              DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-              CODE_SIGN_STYLE=Automatic \
-              clean archive
+              xcodebuild \
+                  -project "$XCODE_CONTAINER" \
+                  -scheme "$XCODE_SCHEME" \
+                  -configuration Release \
+                  -destination "generic/platform=iOS" \
+                  -archivePath "$ARCHIVE_PATH" \
+                  -allowProvisioningUpdates \
+                  -authenticationKeyPath "$ASC_KEY_PATH" \
+                  -authenticationKeyID "$ASC_KEY_ID" \
+                  -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+                  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+                  CODE_SIGN_STYLE=Automatic \
+                  clean archive \
+                  2>&1 |
+                  tee "$GITHUB_WORKSPACE/logs/archive.log"
 
           fi
 
           if [ ! -d "$ARCHIVE_PATH" ]; then
-            echo "ERROR: Xcode archive was not created."
-            exit 1
+
+              echo "::error::Xcode reported success but no archive was created."
+              exit 1
+
           fi
 
           echo ""
-          echo "Archive created:"
+          echo "✓ Archive created."
+          echo ""
+
           du -sh "$ARCHIVE_PATH"
 
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+
 
       # ============================================================
-      # 9. Create App Store export configuration
+      # 14. Read final app metadata from the actual archive
+      #
+      # Useful both for diagnostics and our eventual Windows UI.
       # ============================================================
 
-      - name: Create ExportOptions.plist
+      - name: Read archive metadata
+        run: |
+          set -Eeuo pipefail
+
+          APP_INFO=$(
+              find "$ARCHIVE_PATH/Products/Applications" \
+                  -maxdepth 2 \
+                  -name Info.plist \
+                  -print \
+                  -quit
+          )
+
+          if [ -z "$APP_INFO" ]; then
+
+              echo "::error::Could not locate the archived application's Info.plist."
+              exit 1
+
+          fi
+
+          ARCHIVE_BUNDLE_ID=$(
+              /usr/libexec/PlistBuddy \
+                  -c "Print :CFBundleIdentifier" \
+                  "$APP_INFO"
+          )
+
+          ARCHIVE_VERSION=$(
+              /usr/libexec/PlistBuddy \
+                  -c "Print :CFBundleShortVersionString" \
+                  "$APP_INFO"
+          )
+
+          ARCHIVE_BUILD=$(
+              /usr/libexec/PlistBuddy \
+                  -c "Print :CFBundleVersion" \
+                  "$APP_INFO"
+          )
+
+          echo "Archive:"
+          echo ""
+          echo "  App:      $APP_DISPLAY_NAME"
+          echo "  Bundle:   $ARCHIVE_BUNDLE_ID"
+          echo "  Version:  $ARCHIVE_VERSION"
+          echo "  Build:    $ARCHIVE_BUILD"
+
+          if [ "$ARCHIVE_BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]; then
+
+              echo ""
+              echo "::error::Archived bundle identifier changed unexpectedly."
+              exit 1
+
+          fi
+
+          echo ""
+
+          echo "ARCHIVE_VERSION=$ARCHIVE_VERSION" >> "$GITHUB_ENV"
+          echo "ARCHIVE_BUILD=$ARCHIVE_BUILD" >> "$GITHUB_ENV"
+
+
+      # ============================================================
+      # 15. Create App Store export configuration
+      # ============================================================
+
+      - name: Create App Store export configuration
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          set -Eeuo pipefail
+
+          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+
+          cat > "$EXPORT_OPTIONS" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -309,109 +839,182 @@ jobs:
           </plist>
           EOF
 
-          echo "ExportOptions.plist:"
-          cat "$RUNNER_TEMP/ExportOptions.plist"
+          echo "EXPORT_OPTIONS=$EXPORT_OPTIONS" >> "$GITHUB_ENV"
+
+          echo "✓ App Store export configuration created."
 
 
       # ============================================================
-      # 10. Export signed IPA
+      # 16. Export signed IPA
       # ============================================================
 
-      - name: Export Fortellervegg IPA
+      - name: Export signed IPA
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
+          set -Eeuo pipefail
+
           EXPORT_PATH="$GITHUB_WORKSPACE/export"
 
           mkdir -p "$EXPORT_PATH"
 
-          xcodebuild \
-            -exportArchive \
-            -archivePath "$RUNNER_TEMP/Fortellervegg.xcarchive" \
-            -exportPath "$EXPORT_PATH" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
-
+          echo "=========================================="
+          echo "Exporting IPA"
+          echo "=========================================="
           echo ""
-          echo "Exported files:"
-          find "$EXPORT_PATH" -maxdepth 2 -type f -print
 
-          IPA_PATH=$(find "$EXPORT_PATH" \
-            -maxdepth 1 \
-            -type f \
-            -name "*.ipa" \
-            -print \
-            -quit)
+          xcodebuild \
+              -exportArchive \
+              -archivePath "$ARCHIVE_PATH" \
+              -exportPath "$EXPORT_PATH" \
+              -exportOptionsPlist "$EXPORT_OPTIONS" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$ASC_KEY_PATH" \
+              -authenticationKeyID "$ASC_KEY_ID" \
+              -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+              2>&1 |
+              tee "$GITHUB_WORKSPACE/logs/export.log"
+
+          IPA_PATH=$(
+              find "$EXPORT_PATH" \
+                  -maxdepth 1 \
+                  -type f \
+                  -name "*.ipa" \
+                  -print \
+                  -quit
+          )
 
           if [ -z "$IPA_PATH" ]; then
-            echo ""
-            echo "ERROR: No IPA was produced."
-            exit 1
+
+              echo ""
+              echo "::error::No IPA was produced."
+              exit 1
+
           fi
 
           echo ""
-          echo "IPA produced successfully:"
-          echo "$IPA_PATH"
-
+          echo "✓ IPA exported."
           echo ""
-          echo "IPA size:"
-          du -h "$IPA_PATH"
+
+          ls -lh "$IPA_PATH"
 
           echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
 
 
       # ============================================================
-      # 11. Upload directly to App Store Connect
+      # 17. Upload directly to App Store Connect
       #
-      # This replaces Transporter.
+      # This is the point of no return:
       #
-      # Apple processes the uploaded build after this completes.
-      # Once processing completes, it should appear in TestFlight.
+      # The binary is sent to Apple and will subsequently enter
+      # App Store Connect / TestFlight processing.
       # ============================================================
 
-      - name: Upload Fortellervegg to App Store Connect
+      - name: Upload to App Store Connect
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
-          echo "Uploading IPA to App Store Connect:"
-          echo "$IPA_PATH"
+          set -Eeuo pipefail
+
+          echo "=========================================="
+          echo "Uploading to App Store Connect"
+          echo "=========================================="
+          echo ""
+          echo "App:      $APP_DISPLAY_NAME"
+          echo "Version:  $ARCHIVE_VERSION"
+          echo "Build:    $ARCHIVE_BUILD"
           echo ""
 
+          API_PRIVATE_KEYS_DIR="$API_PRIVATE_KEYS_DIR" \
           xcrun altool \
-            --upload-app \
-            -f "$IPA_PATH" \
-            -t ios \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
+              --upload-app \
+              -f "$IPA_PATH" \
+              -t ios \
+              --apiKey "$ASC_KEY_ID" \
+              --apiIssuer "$ASC_ISSUER_ID" \
+              2>&1 |
+              tee "$GITHUB_WORKSPACE/logs/upload.log"
 
           echo ""
           echo "=========================================="
-          echo "Fortellervegg upload completed successfully."
+          echo "✓ UPLOAD COMPLETE"
           echo "=========================================="
+          echo ""
+          echo "$APP_DISPLAY_NAME"
+          echo "Version $ARCHIVE_VERSION"
+          echo "Build $ARCHIVE_BUILD"
+          echo ""
+          echo "Apple will now process the build for TestFlight."
 
 
       # ============================================================
-      # 12. Save IPA as a GitHub Actions artifact
+      # 18. Save the resulting IPA and useful diagnostic logs
       #
-      # Current Node 24-compatible action.
+      # This uses the current Node 24-compatible upload-artifact v7.
       #
-      # 'always()' means we also try to preserve the IPA if Apple's
-      # upload rejects it, which is useful for troubleshooting.
+      # always() means we preserve whatever useful output exists even
+      # when Apple rejects a build or an earlier step fails.
       # ============================================================
 
-      - name: Save Fortellervegg IPA
+      - name: Save build artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: Fortellervegg-AppStore
+          name: "${{ inputs.app }}-${{ inputs.request_id }}"
           path: |
             export/*.ipa
             export/DistributionSummary.plist
             export/Packaging.log
+            logs/*.log
           if-no-files-found: warn
           retention-days: 14
+
+
+      # ============================================================
+      # 19. Human-readable GitHub summary
+      # ============================================================
+
+      - name: Write build summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+              echo "# iOS App Store Build"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| App | ${APP_DISPLAY_NAME:-${{ inputs.app }}} |"
+              echo "| Environment | \`${{ inputs.app }}\` |"
+              echo "| Bundle ID | \`${EXPECTED_BUNDLE_ID:-unknown}\` |"
+              echo "| Request | \`${REQUEST_ID}\` |"
+              echo "| Input | \`${INPUT_ASSET_NAME}\` |"
+              echo "| Status | **${JOB_STATUS}** |"
+
+              if [ -n "${ARCHIVE_VERSION:-}" ]; then
+                  echo "| Version | ${ARCHIVE_VERSION} |"
+              fi
+
+              if [ -n "${ARCHIVE_BUILD:-}" ]; then
+                  echo "| Build | ${ARCHIVE_BUILD} |"
+              fi
+
+              echo ""
+
+              if [ "$JOB_STATUS" = "success" ]; then
+
+                  echo "## ✅ Uploaded to App Store Connect"
+                  echo ""
+                  echo "Apple will now process this build for TestFlight."
+
+              else
+
+                  echo "## ❌ Build failed"
+                  echo ""
+                  echo "Check the failed workflow step and the saved build logs."
+
+              fi
+
+          } >> "$GITHUB_STEP_SUMMARY"
