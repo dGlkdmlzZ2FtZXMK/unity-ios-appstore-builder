@@ -1,0 +1,149 @@
+name: Build Fortellervegg iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+
+      - name: Download Unity iOS export
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input
+          mkdir -p ios-project
+
+          gh release download ios-input \
+            --pattern "Fortellervegg-iOS.zip" \
+            --dir input
+
+          ditto -x -k \
+            input/Fortellervegg-iOS.zip \
+            ios-project
+
+      - name: Install App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+        run: |
+          KEY_DIR="$RUNNER_TEMP/appstore"
+          mkdir -p "$KEY_DIR"
+
+          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+
+          echo "$ASC_PRIVATE_KEY_BASE64" | base64 -D > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Install CocoaPods if required
+        working-directory: ios-project
+        run: |
+          if [ -f "Podfile" ]; then
+            if [ -f "Podfile.lock" ]; then
+              pod install --deployment
+            else
+              pod install
+            fi
+          fi
+
+      - name: Archive Fortellervegg
+        working-directory: ios-project
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          if [ -d "Unity-iPhone.xcworkspace" ]; then
+            BUILD_CONTAINER=(-workspace "Unity-iPhone.xcworkspace")
+          else
+            BUILD_CONTAINER=(-project "Unity-iPhone.xcodeproj")
+          fi
+
+          xcodebuild \
+            "${BUILD_CONTAINER[@]}" \
+            -scheme "Unity-iPhone" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/Fortellervegg.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            clean archive
+
+      - name: Create ExportOptions.plist
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+
+              <key>teamID</key>
+              <string>${APPLE_TEAM_ID}</string>
+
+              <key>signingStyle</key>
+              <string>automatic</string>
+
+              <key>generateAppStoreInformation</key>
+              <true/>
+
+              <key>uploadSymbols</key>
+              <true/>
+
+              <key>stripSwiftSymbols</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export IPA
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/export"
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/Fortellervegg.xcarchive" \
+            -exportPath "$GITHUB_WORKSPACE/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+          echo "Exported files:"
+          find "$GITHUB_WORKSPACE/export" -maxdepth 2 -type f -print
+
+      - name: Upload App Store build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fortellervegg-AppStore
+          path: |
+            export/*.ipa
+            export/AppStoreInfo.plist
+            export/DistributionSummary.plist
+            export/Packaging.log
+          retention-days: 14
