@@ -29,9 +29,7 @@ on:
 
 # ----------------------------------------------------------------
 # Only one build of a given app may run at once.
-#
-# Fortellervegg and HFDU can still build simultaneously because
-# their concurrency groups are different.
+# Different apps can still build simultaneously.
 # ----------------------------------------------------------------
 
 concurrency:
@@ -57,13 +55,8 @@ jobs:
     env:
 
       # ------------------------------------------------------------
-      # App-specific configuration.
-      #
-      # These come from the selected GitHub Environment:
-      #
-      # fortellervegg
-      # hfdu
-      # etc.
+      # App-specific configuration from the selected GitHub
+      # Environment.
       # ------------------------------------------------------------
 
       APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME }}
@@ -83,9 +76,6 @@ jobs:
 
       # ============================================================
       # 1. Validate workflow configuration
-      #
-      # Fail immediately if an environment or repository secret
-      # hasn't been configured correctly.
       # ============================================================
 
       - name: Validate configuration
@@ -167,9 +157,6 @@ jobs:
 
       # ============================================================
       # 2. Select Xcode
-      #
-      # We deliberately pin the Xcode version rather than accepting
-      # whatever GitHub currently marks as default.
       # ============================================================
 
       - name: Select Xcode 26.6
@@ -202,11 +189,6 @@ jobs:
 
       # ============================================================
       # 3. Download the exact Unity-generated ZIP
-      #
-      # Release:
-      #   ios-inputs
-      #
-      # The asset filename is unique to this publishing request.
       # ============================================================
 
       - name: Download Unity iOS package
@@ -244,9 +226,6 @@ jobs:
 
       # ============================================================
       # 4. Verify package checksum
-      #
-      # Windows calculates SHA-256 before uploading.
-      # The Mac independently calculates it again after downloading.
       # ============================================================
 
       - name: Verify package SHA-256
@@ -284,8 +263,6 @@ jobs:
 
       # ============================================================
       # 5. Inspect ZIP for unsafe paths
-      #
-      # Refuse absolute paths or ../ traversal before extraction.
       # ============================================================
 
       - name: Validate ZIP structure
@@ -328,24 +305,6 @@ jobs:
 
       # ============================================================
       # 6. Extract Unity-generated Xcode project
-      #
-      # The ZIP must contain the CONTENTS of the Unity iOS build
-      # directory directly.
-      #
-      # Correct:
-      #
-      # ZIP
-      # ├─ Unity-iPhone.xcodeproj
-      # ├─ Classes
-      # ├─ Data
-      # └─ ...
-      #
-      # Incorrect:
-      #
-      # ZIP
-      # └─ Fortellervegg-iOS
-      #    ├─ Unity-iPhone.xcodeproj
-      #    └─ ...
       # ============================================================
 
       - name: Extract Unity iOS project
@@ -383,11 +342,6 @@ jobs:
 
       # ============================================================
       # 7. Install the App Store Connect API key
-      #
-      # The temporary copy is passed explicitly to xcodebuild.
-      #
-      # A second copy is put in Apple's conventional private-key
-      # directory for altool.
       # ============================================================
 
       - name: Install App Store Connect API key
@@ -475,9 +429,57 @@ jobs:
 
 
       # ============================================================
-      # 9. Determine whether this project uses .xcworkspace
+      # 9. Restore Unix executable permissions
       #
-      # CocoaPods normally creates Unity-iPhone.xcworkspace.
+      # The Unity iOS export is packaged on Windows. Windows ZIPs do
+      # not reliably preserve Unix executable permission bits.
+      #
+      # Unity and plugins may include scripts such as:
+      #
+      #   process_symbols.sh
+      #
+      # which Xcode executes directly during Archive.
+      # ============================================================
+
+      - name: Restore script permissions
+        working-directory: ios-project
+        run: |
+          set -Eeuo pipefail
+
+          echo "Restoring executable permissions on shell scripts..."
+          echo ""
+
+          SCRIPT_COUNT=$(
+              find . \
+                  -type f \
+                  -name "*.sh" \
+                  | wc -l \
+                  | tr -d ' '
+          )
+
+          if [ "$SCRIPT_COUNT" -eq 0 ]; then
+              echo "No .sh files found."
+              echo "✓ No permissions needed restoring."
+              exit 0
+          fi
+
+          find . \
+              -type f \
+              -name "*.sh" \
+              -exec chmod +x {} +
+
+          echo "✓ Marked $SCRIPT_COUNT shell scripts executable."
+
+          echo ""
+          echo "Executable shell scripts:"
+          find . \
+              -type f \
+              -name "*.sh" \
+              -exec ls -l {} \;
+
+
+      # ============================================================
+      # 10. Determine .xcworkspace or .xcodeproj
       # ============================================================
 
       - name: Determine Xcode build container
@@ -505,7 +507,7 @@ jobs:
 
 
       # ============================================================
-      # 10. Verify that the configured scheme actually exists
+      # 11. Verify configured Xcode scheme
       # ============================================================
 
       - name: Verify Xcode scheme
@@ -565,12 +567,7 @@ jobs:
 
 
       # ============================================================
-      # 11. Verify bundle identifier
-      #
-      # This independently confirms that the package dispatched as
-      # a particular app actually contains that app's bundle ID.
-      #
-      # This check occurs BEFORE signing or uploading anything.
+      # 12. Verify bundle identifier
       # ============================================================
 
       - name: Verify app identity
@@ -648,7 +645,7 @@ jobs:
 
 
       # ============================================================
-      # 12. Prepare build log directory
+      # 13. Prepare build logs
       # ============================================================
 
       - name: Prepare build logs
@@ -659,10 +656,7 @@ jobs:
 
 
       # ============================================================
-      # 13. Archive the application
-      #
-      # Xcode communicates with Apple's provisioning/signing service
-      # using the shared App Store Connect API key.
+      # 14. Archive the application
       # ============================================================
 
       - name: Archive iOS app
@@ -739,9 +733,7 @@ jobs:
 
 
       # ============================================================
-      # 14. Read final app metadata from the actual archive
-      #
-      # Useful both for diagnostics and our eventual Windows UI.
+      # 15. Read final metadata from archive
       # ============================================================
 
       - name: Read archive metadata
@@ -803,7 +795,7 @@ jobs:
 
 
       # ============================================================
-      # 15. Create App Store export configuration
+      # 16. Create App Store export configuration
       # ============================================================
 
       - name: Create App Store export configuration
@@ -845,7 +837,7 @@ jobs:
 
 
       # ============================================================
-      # 16. Export signed IPA
+      # 17. Export signed IPA
       # ============================================================
 
       - name: Export signed IPA
@@ -903,12 +895,7 @@ jobs:
 
 
       # ============================================================
-      # 17. Upload directly to App Store Connect
-      #
-      # This is the point of no return:
-      #
-      # The binary is sent to Apple and will subsequently enter
-      # App Store Connect / TestFlight processing.
+      # 18. Upload directly to App Store Connect
       # ============================================================
 
       - name: Upload to App Store Connect
@@ -950,12 +937,7 @@ jobs:
 
 
       # ============================================================
-      # 18. Save the resulting IPA and useful diagnostic logs
-      #
-      # This uses the current Node 24-compatible upload-artifact v7.
-      #
-      # always() means we preserve whatever useful output exists even
-      # when Apple rejects a build or an earlier step fails.
+      # 19. Save IPA and diagnostic logs
       # ============================================================
 
       - name: Save build artifacts
@@ -973,7 +955,7 @@ jobs:
 
 
       # ============================================================
-      # 19. Human-readable GitHub summary
+      # 20. Human-readable GitHub summary
       # ============================================================
 
       - name: Write build summary
