@@ -84,6 +84,8 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+          IOS_DEVELOPMENT_P12_BASE64: ${{ secrets.IOS_DEVELOPMENT_P12_BASE64 }}
+          IOS_DEVELOPMENT_P12_PASSWORD: ${{ secrets.IOS_DEVELOPMENT_P12_PASSWORD }}
         run: |
           set -Eeuo pipefail
 
@@ -121,6 +123,9 @@ jobs:
           check_value "ASC_KEY_ID" "$ASC_KEY_ID"
           check_value "ASC_ISSUER_ID" "$ASC_ISSUER_ID"
           check_value "ASC_PRIVATE_KEY_BASE64" "$ASC_PRIVATE_KEY_BASE64"
+
+          check_value "IOS_DEVELOPMENT_P12_BASE64" "$IOS_DEVELOPMENT_P12_BASE64"
+          check_value "IOS_DEVELOPMENT_P12_PASSWORD" "$IOS_DEVELOPMENT_P12_PASSWORD"
 
           echo ""
 
@@ -341,7 +346,11 @@ jobs:
 
 
       # ============================================================
-      # 7. Install the App Store Connect API key
+      # 7. Install App Store Connect API key
+      #
+      # Used for:
+      # - Xcode provisioning communication
+      # - App Store Connect upload
       # ============================================================
 
       - name: Install App Store Connect API key
@@ -385,7 +394,124 @@ jobs:
 
 
       # ============================================================
-      # 8. Install CocoaPods dependencies when required
+      # 8. Install persistent Apple Development signing identity
+      #
+      # This is the critical CI improvement.
+      #
+      # Instead of letting every ephemeral GitHub runner create a new
+      # Apple Development certificate, every runner imports the SAME
+      # persistent certificate/private-key pair from GitHub Secrets.
+      #
+      # Required repository secrets:
+      #
+      #   IOS_DEVELOPMENT_P12_BASE64
+      #   IOS_DEVELOPMENT_P12_PASSWORD
+      # ============================================================
+
+      - name: Install persistent Apple Development identity
+        env:
+          IOS_DEVELOPMENT_P12_BASE64: ${{ secrets.IOS_DEVELOPMENT_P12_BASE64 }}
+          IOS_DEVELOPMENT_P12_PASSWORD: ${{ secrets.IOS_DEVELOPMENT_P12_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "=========================================="
+          echo "Installing persistent signing identity"
+          echo "=========================================="
+          echo ""
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/ios-development.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          # Generate a fresh password for this temporary keychain.
+          # It only exists for the lifetime of this GitHub runner.
+          KEYCHAIN_PASSWORD="$(uuidgen)-$(uuidgen)"
+
+          # Make the keychain path available to later steps and to
+          # the always-running cleanup step.
+          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          # Restore the P12 from the encrypted GitHub secret.
+          printf '%s' "$IOS_DEVELOPMENT_P12_BASE64" |
+              base64 -D \
+              > "$CERTIFICATE_PATH"
+
+          if [ ! -s "$CERTIFICATE_PATH" ]; then
+              echo "::error::Persistent Apple Development P12 could not be restored."
+              exit 1
+          fi
+
+          chmod 600 "$CERTIFICATE_PATH"
+
+          # Create and unlock a temporary keychain.
+          security create-keychain \
+              -p "$KEYCHAIN_PASSWORD" \
+              "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+              -lut 21600 \
+              "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+              -p "$KEYCHAIN_PASSWORD" \
+              "$KEYCHAIN_PATH"
+
+          # Import certificate + private key.
+          security import \
+              "$CERTIFICATE_PATH" \
+              -P "$IOS_DEVELOPMENT_P12_PASSWORD" \
+              -A \
+              -t cert \
+              -f pkcs12 \
+              -k "$KEYCHAIN_PATH"
+
+          # Allow Apple/Xcode signing tools to access the private key
+          # non-interactively.
+          security set-key-partition-list \
+              -S apple-tool:,apple: \
+              -k "$KEYCHAIN_PASSWORD" \
+              "$KEYCHAIN_PATH"
+
+          # Make this the keychain Xcode searches for signing identities.
+          security list-keychains \
+              -d user \
+              -s "$KEYCHAIN_PATH"
+
+          security default-keychain \
+              -d user \
+              -s "$KEYCHAIN_PATH"
+
+          echo ""
+          echo "Signing identities available:"
+          echo ""
+
+          IDENTITY_OUTPUT=$(
+              security find-identity \
+                  -v \
+                  -p codesigning \
+                  "$KEYCHAIN_PATH"
+          )
+
+          echo "$IDENTITY_OUTPUT"
+
+          if ! echo "$IDENTITY_OUTPUT" |
+              grep -Fq "Apple Development"; then
+
+              echo ""
+              echo "::error::The imported P12 does not contain a usable Apple Development signing identity."
+              echo "::error::Make sure the P12 contains both the Apple Development certificate and its private key."
+
+              exit 1
+
+          fi
+
+          echo ""
+          echo "✓ Persistent Apple Development identity installed."
+          echo "✓ Xcode will reuse this identity instead of creating a new one."
+
+
+      # ============================================================
+      # 9. Install CocoaPods dependencies when required
       # ============================================================
 
       - name: Install CocoaPods dependencies
@@ -429,16 +555,11 @@ jobs:
 
 
       # ============================================================
-      # 9. Restore Unix executable permissions
+      # 10. Restore Unix executable permissions
       #
-      # The Unity iOS export is packaged on Windows. Windows ZIPs do
-      # not reliably preserve Unix executable permission bits.
-      #
-      # Unity and plugins may include scripts such as:
-      #
-      #   process_symbols.sh
-      #
-      # which Xcode executes directly during Archive.
+      # Windows ZIP archives do not reliably preserve Unix executable
+      # permission bits. Unity/plugins may contain shell scripts that
+      # Xcode executes directly.
       # ============================================================
 
       - name: Restore script permissions
@@ -472,6 +593,7 @@ jobs:
 
           echo ""
           echo "Executable shell scripts:"
+
           find . \
               -type f \
               -name "*.sh" \
@@ -479,7 +601,7 @@ jobs:
 
 
       # ============================================================
-      # 10. Determine .xcworkspace or .xcodeproj
+      # 11. Determine .xcworkspace or .xcodeproj
       # ============================================================
 
       - name: Determine Xcode build container
@@ -507,7 +629,7 @@ jobs:
 
 
       # ============================================================
-      # 11. Verify configured Xcode scheme
+      # 12. Verify configured Xcode scheme
       # ============================================================
 
       - name: Verify Xcode scheme
@@ -567,7 +689,7 @@ jobs:
 
 
       # ============================================================
-      # 12. Verify bundle identifier
+      # 13. Verify bundle identifier
       # ============================================================
 
       - name: Verify app identity
@@ -645,7 +767,7 @@ jobs:
 
 
       # ============================================================
-      # 13. Prepare build logs
+      # 14. Prepare build logs
       # ============================================================
 
       - name: Prepare build logs
@@ -656,7 +778,13 @@ jobs:
 
 
       # ============================================================
-      # 14. Archive the application
+      # 15. Archive the application
+      #
+      # Automatic provisioning remains enabled.
+      #
+      # Difference from the old workflow:
+      # Xcode now already has our persistent Apple Development
+      # identity and private key available in its keychain.
       # ============================================================
 
       - name: Archive iOS app
@@ -676,6 +804,14 @@ jobs:
           echo ""
           echo "$APP_DISPLAY_NAME"
           echo "$EXPECTED_BUNDLE_ID"
+          echo ""
+
+          echo "Available signing identities:"
+          security find-identity \
+              -v \
+              -p codesigning \
+              "$SIGNING_KEYCHAIN_PATH"
+
           echo ""
 
           if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
@@ -733,7 +869,7 @@ jobs:
 
 
       # ============================================================
-      # 15. Read final metadata from archive
+      # 16. Read final metadata from archive
       # ============================================================
 
       - name: Read archive metadata
@@ -795,7 +931,7 @@ jobs:
 
 
       # ============================================================
-      # 16. Create App Store export configuration
+      # 17. Create App Store export configuration
       # ============================================================
 
       - name: Create App Store export configuration
@@ -837,7 +973,7 @@ jobs:
 
 
       # ============================================================
-      # 17. Export signed IPA
+      # 18. Export signed IPA
       # ============================================================
 
       - name: Export signed IPA
@@ -895,7 +1031,7 @@ jobs:
 
 
       # ============================================================
-      # 18. Upload directly to App Store Connect
+      # 19. Upload directly to App Store Connect
       # ============================================================
 
       - name: Upload to App Store Connect
@@ -937,7 +1073,7 @@ jobs:
 
 
       # ============================================================
-      # 19. Save IPA and diagnostic logs
+      # 20. Save IPA and diagnostic logs
       # ============================================================
 
       - name: Save build artifacts
@@ -955,7 +1091,7 @@ jobs:
 
 
       # ============================================================
-      # 20. Human-readable GitHub summary
+      # 21. Human-readable GitHub summary
       # ============================================================
 
       - name: Write build summary
@@ -1000,3 +1136,34 @@ jobs:
               fi
 
           } >> "$GITHUB_STEP_SUMMARY"
+
+
+      # ============================================================
+      # 22. Clean up temporary signing material
+      #
+      # GitHub-hosted runners are destroyed after the job anyway,
+      # but explicitly removing our temporary keychain/P12 keeps the
+      # workflow tidy and also makes it safer if this is ever adapted
+      # to a persistent runner.
+      # ============================================================
+
+      - name: Clean up signing identity
+        if: always()
+        run: |
+          set +e
+
+          echo "Cleaning temporary signing material..."
+
+          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ] &&
+             [ -f "$SIGNING_KEYCHAIN_PATH" ]; then
+
+              security delete-keychain \
+                  "$SIGNING_KEYCHAIN_PATH" \
+                  >/dev/null 2>&1 || true
+
+          fi
+
+          rm -f \
+              "$RUNNER_TEMP/ios-development.p12"
+
+          echo "✓ Temporary signing material cleaned."
