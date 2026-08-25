@@ -1,84 +1,112 @@
-name: Build iOS → App Store Connect
-
-run-name: "${{ inputs.app }} • ${{ inputs.request_id }}"
+name: Reusable Unity iOS App Store build
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-
       app:
-        description: App environment
+        description: Stable app key
         required: true
-        type: environment
-
+        type: string
+      app_display_name:
+        description: Human-readable app name
+        required: true
+        type: string
+      expected_bundle_id:
+        description: Expected application bundle identifier
+        required: true
+        type: string
+      xcode_scheme:
+        description: Xcode scheme to archive
+        required: true
+        type: string
+      unity_version:
+        description: Exact Unity editor version used for the export
+        required: true
+        type: string
+      xcode_version:
+        description: Xcode application version on the hosted runner
+        required: false
+        default: "26.6"
+        type: string
       asset_name:
         description: Exact ZIP asset name from the ios-inputs release
         required: true
         type: string
-
       sha256:
         description: Expected SHA-256 of the uploaded ZIP
         required: true
         type: string
-
+      content_sha256:
+        description: Stable SHA-256 of the uncompressed project contents
+        required: true
+        type: string
+      native_source_sha256:
+        description: Stable SHA-256 of generated IL2CPP C++ source files
+        required: true
+        type: string
       request_id:
         description: Unique publisher request ID
         required: true
         type: string
-
-
-# ----------------------------------------------------------------
-# Only one build of a given app may run at once.
-# Different apps can still build simultaneously.
-# ----------------------------------------------------------------
-
-concurrency:
-  group: appstore-${{ inputs.app }}
-  cancel-in-progress: false
-
+      upload_to_app_store:
+        description: Upload the exported IPA to App Store Connect
+        required: false
+        default: true
+        type: boolean
+      keep_ipa_artifact:
+        description: Retain the successful IPA as a GitHub artifact
+        required: false
+        default: false
+        type: boolean
+      use_build_cache:
+        description: Restore and save CocoaPods and IL2CPP build caches
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      APPLE_TEAM_ID:
+        required: true
+      ASC_KEY_ID:
+        required: true
+      ASC_ISSUER_ID:
+        required: true
+      ASC_PRIVATE_KEY_BASE64:
+        required: true
+      IOS_DEVELOPMENT_P12_BASE64:
+        required: true
+      IOS_DEVELOPMENT_P12_PASSWORD:
+        required: true
 
 permissions:
   contents: read
 
-
 jobs:
-
   build-ios:
-
     name: Build ${{ inputs.app }}
-
     runs-on: macos-26
-
-    environment:
-      name: ${{ inputs.app }}
+    timeout-minutes: 45
 
     env:
-
-      # ------------------------------------------------------------
-      # App-specific configuration from the selected GitHub
-      # Environment.
-      # ------------------------------------------------------------
-
-      APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME }}
-      EXPECTED_BUNDLE_ID: ${{ vars.EXPECTED_BUNDLE_ID }}
-      XCODE_SCHEME: ${{ vars.XCODE_SCHEME }}
-
-      # ------------------------------------------------------------
-      # Request information supplied by the Windows publisher.
-      # ------------------------------------------------------------
-
+      BUILDER_CORE_VERSION: "2.2.0"
+      APP_KEY: ${{ inputs.app }}
+      APP_DISPLAY_NAME: ${{ inputs.app_display_name }}
+      EXPECTED_BUNDLE_ID: ${{ inputs.expected_bundle_id }}
+      XCODE_SCHEME: ${{ inputs.xcode_scheme }}
+      UNITY_VERSION: ${{ inputs.unity_version }}
+      XCODE_VERSION: ${{ inputs.xcode_version }}
       INPUT_ASSET_NAME: ${{ inputs.asset_name }}
       INPUT_SHA256: ${{ inputs.sha256 }}
+      INPUT_CONTENT_SHA256: ${{ inputs.content_sha256 }}
+      INPUT_NATIVE_SOURCE_SHA256: ${{ inputs.native_source_sha256 }}
       REQUEST_ID: ${{ inputs.request_id }}
-
+      UPLOAD_TO_APP_STORE: ${{ inputs.upload_to_app_store }}
+      KEEP_IPA_ARTIFACT: ${{ inputs.keep_ipa_artifact }}
+      USE_BUILD_CACHE: ${{ inputs.use_build_cache }}
+      RELEASE_TAG: ios-inputs
+      SEGMENT_DOWNLOAD_TIMEOUT_MINS: "5"
 
     steps:
-
-      # ============================================================
-      # 1. Validate workflow configuration
-      # ============================================================
-
-      - name: Validate configuration
+      - name: Validate workflow configuration
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -86,194 +114,176 @@ jobs:
           ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
           IOS_DEVELOPMENT_P12_BASE64: ${{ secrets.IOS_DEVELOPMENT_P12_BASE64 }}
           IOS_DEVELOPMENT_P12_PASSWORD: ${{ secrets.IOS_DEVELOPMENT_P12_PASSWORD }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
           echo "=========================================="
-          echo "Unity iOS App Store Builder"
+          echo "Tidvis Unity iOS App Store Builder"
           echo "=========================================="
+          echo "Core version:  $BUILDER_CORE_VERSION"
+          echo "Caller repo:   $GITHUB_REPOSITORY"
+          echo "App:           $APP_DISPLAY_NAME ($APP_KEY)"
+          echo "Bundle ID:     $EXPECTED_BUNDLE_ID"
+          echo "Unity:         $UNITY_VERSION"
+          echo "Xcode:         $XCODE_VERSION"
+          echo "Scheme:        $XCODE_SCHEME"
+          echo "Request:       $REQUEST_ID"
+          echo "Input:         $INPUT_ASSET_NAME"
+          echo "Content SHA:   $INPUT_CONTENT_SHA256"
+          echo "IL2CPP SHA:    $INPUT_NATIVE_SOURCE_SHA256"
+          echo "Upload:        $UPLOAD_TO_APP_STORE"
+          echo "Keep IPA:      $KEEP_IPA_ARTIFACT"
+          echo "Use caches:    $USE_BUILD_CACHE"
           echo ""
-          echo "App:        $APP_DISPLAY_NAME"
-          echo "Bundle ID:  $EXPECTED_BUNDLE_ID"
-          echo "Scheme:     $XCODE_SCHEME"
-          echo "Request:    $REQUEST_ID"
-          echo "Input:      $INPUT_ASSET_NAME"
-          echo ""
 
-          FAILED=0
+          echo "BUILDER_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
-          check_value()
-          {
-              NAME="$1"
-              VALUE="$2"
+          failed=0
 
-              if [ -z "$VALUE" ]; then
-                  echo "::error::$NAME is not configured."
-                  FAILED=1
-              else
-                  echo "✓ $NAME"
-              fi
+          check_value() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "$value" ]]; then
+              echo "::error::$name is not configured."
+              failed=1
+            else
+              echo "✓ $name"
+            fi
           }
 
+          check_value "APP_KEY" "$APP_KEY"
           check_value "APP_DISPLAY_NAME" "$APP_DISPLAY_NAME"
           check_value "EXPECTED_BUNDLE_ID" "$EXPECTED_BUNDLE_ID"
           check_value "XCODE_SCHEME" "$XCODE_SCHEME"
-
+          check_value "UNITY_VERSION" "$UNITY_VERSION"
+          check_value "XCODE_VERSION" "$XCODE_VERSION"
           check_value "APPLE_TEAM_ID" "$APPLE_TEAM_ID"
           check_value "ASC_KEY_ID" "$ASC_KEY_ID"
           check_value "ASC_ISSUER_ID" "$ASC_ISSUER_ID"
           check_value "ASC_PRIVATE_KEY_BASE64" "$ASC_PRIVATE_KEY_BASE64"
-
           check_value "IOS_DEVELOPMENT_P12_BASE64" "$IOS_DEVELOPMENT_P12_BASE64"
           check_value "IOS_DEVELOPMENT_P12_PASSWORD" "$IOS_DEVELOPMENT_P12_PASSWORD"
 
-          echo ""
+          if ! [[ "$APP_KEY" =~ ^[A-Za-z0-9_-]{2,40}$ ]]; then
+            echo "::error::Invalid app key: $APP_KEY"
+            failed=1
+          fi
 
           if ! [[ "$REQUEST_ID" =~ ^[A-Za-z0-9_-]{4,64}$ ]]; then
-              echo "::error::Invalid request_id."
-              FAILED=1
-          else
-              echo "✓ Request ID format"
+            echo "::error::Invalid request_id."
+            failed=1
           fi
 
           if ! [[ "$INPUT_ASSET_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.zip$ ]]; then
-              echo "::error::Invalid asset filename."
-              FAILED=1
-          else
-              echo "✓ Asset filename format"
+            echo "::error::Invalid asset filename."
+            failed=1
           fi
 
           if ! [[ "$INPUT_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
-              echo "::error::Invalid SHA-256 value."
-              FAILED=1
-          else
-              echo "✓ SHA-256 format"
+            echo "::error::Invalid package SHA-256."
+            failed=1
           fi
 
-          if [ "$FAILED" -ne 0 ]; then
-              echo ""
-              echo "::error::Configuration validation failed."
-              exit 1
+          if ! [[ "$INPUT_CONTENT_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+            echo "::error::Invalid content SHA-256."
+            failed=1
+          fi
+
+          if ! [[ "$INPUT_NATIVE_SOURCE_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+            echo "::error::Invalid IL2CPP source SHA-256."
+            failed=1
+          fi
+
+          if ! [[ "$EXPECTED_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{2,254}$ ]]; then
+            echo "::error::Invalid expected bundle identifier."
+            failed=1
+          fi
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo ""
+            echo "::error::Configuration validation failed."
+            exit 1
           fi
 
           echo ""
-          echo "Configuration valid."
+          echo "✓ Configuration valid."
 
-
-      # ============================================================
-      # 2. Select Xcode
-      # ============================================================
-
-      - name: Select Xcode 26.6
+      - name: Select Xcode
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          XCODE_PATH="/Applications/Xcode_26.6.app"
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app"
 
-          if [ ! -d "$XCODE_PATH" ]; then
-
-              echo "::error::Xcode 26.6 was not found."
-              echo ""
-              echo "Available Xcode installations:"
-              ls -1 /Applications | grep '^Xcode' || true
-
-              exit 1
-
+          if [[ ! -d "$XCODE_PATH" ]]; then
+            echo "::error::Xcode $XCODE_VERSION was not found at $XCODE_PATH."
+            echo "Available Xcode installations:"
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
           fi
 
-          sudo xcode-select \
-              -s "$XCODE_PATH/Contents/Developer"
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
 
           echo "Xcode:"
           xcodebuild -version
-
           echo ""
           echo "iOS SDK:"
           xcrun --sdk iphoneos --show-sdk-version
+          echo ""
+          echo "Host architecture: $(uname -m)"
 
-
-      # ============================================================
-      # 3. Download the exact Unity-generated ZIP
-      # ============================================================
-
-      - name: Download Unity iOS package
+      - name: Download exact Unity iOS package
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          INPUT_DIR="$RUNNER_TEMP/input"
+          input_dir="$RUNNER_TEMP/input"
+          mkdir -p "$input_dir"
 
-          mkdir -p "$INPUT_DIR"
+          echo "Downloading release asset from $GITHUB_REPOSITORY:"
+          echo "  $INPUT_ASSET_NAME"
 
-          echo "Downloading:"
-          echo "$INPUT_ASSET_NAME"
-          echo ""
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$INPUT_ASSET_NAME" \
+            --dir "$input_dir"
 
-          gh release download ios-inputs \
-              --repo "${{ github.repository }}" \
-              --pattern "$INPUT_ASSET_NAME" \
-              --dir "$INPUT_DIR"
+          zip_path="$input_dir/$INPUT_ASSET_NAME"
 
-          ZIP_PATH="$INPUT_DIR/$INPUT_ASSET_NAME"
-
-          if [ ! -f "$ZIP_PATH" ]; then
-              echo "::error::Requested build package was not downloaded."
-              exit 1
+          if [[ ! -f "$zip_path" ]]; then
+            echo "::error::Requested package was not downloaded."
+            exit 1
           fi
 
+          echo "ZIP_PATH=$zip_path" >> "$GITHUB_ENV"
           echo ""
-          echo "Downloaded:"
-          ls -lh "$ZIP_PATH"
-
-          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
-
-
-      # ============================================================
-      # 4. Verify package checksum
-      # ============================================================
+          ls -lh "$zip_path"
 
       - name: Verify package SHA-256
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          EXPECTED_SHA=$(echo "$INPUT_SHA256" | tr '[:upper:]' '[:lower:]')
+          expected="$(printf '%s' "$INPUT_SHA256" | tr '[:upper:]' '[:lower:]')"
+          actual="$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
 
-          ACTUAL_SHA=$(
-              shasum -a 256 "$ZIP_PATH" |
-              awk '{print $1}' |
-              tr '[:upper:]' '[:lower:]'
-          )
+          echo "Expected: $expected"
+          echo "Actual:   $actual"
 
-          echo "Expected:"
-          echo "$EXPECTED_SHA"
-
-          echo ""
-          echo "Received:"
-          echo "$ACTUAL_SHA"
-
-          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-
-              echo ""
-              echo "::error::SHA-256 mismatch."
-              echo "::error::The downloaded build package is not the package that was dispatched."
-
-              exit 1
-
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::SHA-256 mismatch. The release asset is not the package that was dispatched."
+            exit 1
           fi
 
-          echo ""
           echo "✓ Package checksum verified."
 
-
-      # ============================================================
-      # 5. Inspect ZIP for unsafe paths
-      # ============================================================
-
-      - name: Validate ZIP structure
+      - name: Validate ZIP paths
+        shell: bash
         run: |
           set -Eeuo pipefail
-
           export ZIP_PATH
 
           python3 <<'PY'
@@ -291,7 +301,6 @@ jobs:
               sys.exit(1)
 
           entries = archive.infolist()
-
           if not entries:
               print("::error::ZIP archive is empty.")
               sys.exit(1)
@@ -299,7 +308,6 @@ jobs:
           for entry in entries:
               name = entry.filename.replace("\\", "/")
               path = PurePosixPath(name)
-
               if path.is_absolute() or ".." in path.parts:
                   print(f"::error::Unsafe ZIP path detected: {name}")
                   sys.exit(1)
@@ -307,485 +315,597 @@ jobs:
           print(f"✓ ZIP structure validated ({len(entries)} entries).")
           PY
 
-
-      # ============================================================
-      # 6. Extract Unity-generated Xcode project
-      # ============================================================
-
-      - name: Extract Unity iOS project
+      - name: Extract Unity Xcode project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          IOS_PROJECT="$GITHUB_WORKSPACE/ios-project"
+          ios_project="$GITHUB_WORKSPACE/ios-project"
+          mkdir -p "$ios_project"
 
-          mkdir -p "$IOS_PROJECT"
+          ditto -x -k "$ZIP_PATH" "$ios_project"
 
-          ditto \
-              -x \
-              -k \
-              "$ZIP_PATH" \
-              "$IOS_PROJECT"
+          echo "IOS_PROJECT=$ios_project" >> "$GITHUB_ENV"
 
           echo "Extracted root:"
-          ls -lah "$IOS_PROJECT"
+          ls -lah "$ios_project"
 
-          if [ ! -d "$IOS_PROJECT/Unity-iPhone.xcodeproj" ]; then
-
-              echo ""
-              echo "::error::Unity-iPhone.xcodeproj was not found at the root of the ZIP."
-              echo ""
-              echo "Extracted structure:"
-              find "$IOS_PROJECT" -maxdepth 3 -print | head -200
-
-              exit 1
-
+          if [[ ! -d "$ios_project/Unity-iPhone.xcodeproj" ]]; then
+            echo "::error::Unity-iPhone.xcodeproj was not found at the ZIP root."
+            echo "Extracted structure:"
+            find "$ios_project" -maxdepth 3 -print | head -200
+            exit 1
           fi
 
-          echo ""
+          if [[ ! -f "$ios_project/tidvis-build.json" ]]; then
+            echo "::error::tidvis-build.json is missing from the package root."
+            exit 1
+          fi
+
           echo "✓ Unity Xcode project found."
 
+      - name: Prepare diagnostic directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs" "$GITHUB_WORKSPACE/export"
+          echo "Diagnostic logs: $GITHUB_WORKSPACE/logs"
 
-      # ============================================================
-      # 7. Install App Store Connect API key
-      #
-      # Used for:
-      # - Xcode provisioning communication
-      # - App Store Connect upload
-      # ============================================================
+      - name: Validate package manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          export APP_KEY APP_DISPLAY_NAME EXPECTED_BUNDLE_ID XCODE_SCHEME UNITY_VERSION
+          export INPUT_CONTENT_SHA256 INPUT_NATIVE_SOURCE_SHA256 REQUEST_ID IOS_PROJECT
+
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          manifest_path = Path(os.environ["IOS_PROJECT"]) / "tidvis-build.json"
+
+          try:
+              data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+          except Exception as exc:
+              print(f"::error::Could not parse tidvis-build.json: {exc}")
+              sys.exit(1)
+
+          expected = {
+              "app": os.environ["APP_KEY"],
+              "appDisplayName": os.environ["APP_DISPLAY_NAME"],
+              "bundleId": os.environ["EXPECTED_BUNDLE_ID"],
+              "scheme": os.environ["XCODE_SCHEME"],
+              "unityVersion": os.environ["UNITY_VERSION"],
+              "contentSha256": os.environ["INPUT_CONTENT_SHA256"].lower(),
+              "nativeSourceSha256": os.environ["INPUT_NATIVE_SOURCE_SHA256"].lower(),
+              "requestId": os.environ["REQUEST_ID"],
+          }
+
+          errors = []
+          for key, value in expected.items():
+              actual = data.get(key)
+              if key == "contentSha256" and isinstance(actual, str):
+                  actual = actual.lower()
+              if actual != value:
+                  errors.append(f"{key}: expected {value!r}, received {actual!r}")
+
+          if data.get("schemaVersion") != 2:
+              errors.append(
+                  f"schemaVersion: expected 2, received {data.get('schemaVersion')!r}"
+              )
+
+          native_file_count = data.get("nativeSourceFileCount")
+          if not isinstance(native_file_count, int) or native_file_count < 1:
+              errors.append(
+                  "nativeSourceFileCount: expected a positive integer, "
+                  f"received {native_file_count!r}"
+              )
+
+          if errors:
+              print("::error::Package manifest validation failed:")
+              for error in errors:
+                  print(f"  - {error}")
+              sys.exit(1)
+
+          print("Manifest:")
+          for key in (
+              "publisherVersion",
+              "app",
+              "bundleId",
+              "unityVersion",
+              "marketingVersion",
+              "buildNumber",
+              "sourceFileCount",
+              "sourceBytes",
+              "contentSha256",
+              "nativeSourceFileCount",
+              "nativeSourceSha256",
+          ):
+              print(f"  {key}: {data.get(key)}")
+
+          print("✓ Package manifest verified.")
+          PY
+
+      - name: Clamp future file timestamps
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export IOS_PROJECT
+
+          python3 <<'PY'
+          import os
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ["IOS_PROJECT"])
+          now = time.time()
+          future_limit = now + 60
+          safe_time = now - 120
+          changed = []
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  stat = path.stat()
+              except OSError:
+                  continue
+              if stat.st_mtime > future_limit:
+                  os.utime(path, (min(stat.st_atime, safe_time), safe_time))
+                  changed.append(str(path.relative_to(root)))
+
+          print(f"Future timestamps corrected: {len(changed)}")
+          for item in changed[:25]:
+              print(f"  - {item}")
+          if len(changed) > 25:
+              print(f"  ... and {len(changed) - 25} more")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"FUTURE_TIMESTAMP_COUNT={len(changed)}\n")
+          PY
 
       - name: Install App Store Connect API key
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          KEY_DIR="$RUNNER_TEMP/appstore-key"
-          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          key_dir="$RUNNER_TEMP/appstore-key"
+          key_path="$key_dir/AuthKey_${ASC_KEY_ID}.p8"
+          mkdir -p "$key_dir"
 
-          mkdir -p "$KEY_DIR"
+          printf '%s' "$ASC_PRIVATE_KEY_BASE64" | base64 -D > "$key_path"
 
-          echo "$ASC_PRIVATE_KEY_BASE64" |
-              base64 -D \
-              > "$KEY_PATH"
-
-          if [ ! -s "$KEY_PATH" ]; then
-              echo "::error::App Store Connect private key could not be restored."
-              exit 1
+          if [[ ! -s "$key_path" ]]; then
+            echo "::error::App Store Connect private key could not be restored."
+            exit 1
           fi
 
-          chmod 600 "$KEY_PATH"
+          chmod 600 "$key_path"
 
-          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
-          echo "API_PRIVATE_KEYS_DIR=$KEY_DIR" >> "$GITHUB_ENV"
+          altool_key_dir="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$altool_key_dir"
+          cp "$key_path" "$altool_key_dir/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$altool_key_dir/AuthKey_${ASC_KEY_ID}.p8"
 
-          ALTOOL_KEY_DIR="$HOME/.appstoreconnect/private_keys"
-
-          mkdir -p "$ALTOOL_KEY_DIR"
-
-          cp \
-              "$KEY_PATH" \
-              "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
-
-          chmod 600 \
-              "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
-
+          echo "ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+          echo "API_PRIVATE_KEYS_DIR=$key_dir" >> "$GITHUB_ENV"
           echo "✓ App Store Connect API key installed."
-
-
-      # ============================================================
-      # 8. Install persistent Apple Development signing identity
-      #
-      # This is the critical CI improvement.
-      #
-      # Instead of letting every ephemeral GitHub runner create a new
-      # Apple Development certificate, every runner imports the SAME
-      # persistent certificate/private-key pair from GitHub Secrets.
-      #
-      # Required repository secrets:
-      #
-      #   IOS_DEVELOPMENT_P12_BASE64
-      #   IOS_DEVELOPMENT_P12_PASSWORD
-      # ============================================================
 
       - name: Install persistent Apple Development identity
         env:
           IOS_DEVELOPMENT_P12_BASE64: ${{ secrets.IOS_DEVELOPMENT_P12_BASE64 }}
           IOS_DEVELOPMENT_P12_PASSWORD: ${{ secrets.IOS_DEVELOPMENT_P12_PASSWORD }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "=========================================="
-          echo "Installing persistent signing identity"
-          echo "=========================================="
-          echo ""
+          certificate_path="$RUNNER_TEMP/ios-development.p12"
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          keychain_password="$(uuidgen)-$(uuidgen)"
 
-          CERTIFICATE_PATH="$RUNNER_TEMP/ios-development.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          printf '%s' "$IOS_DEVELOPMENT_P12_BASE64" | base64 -D > "$certificate_path"
 
-          # Generate a fresh password for this temporary keychain.
-          # It only exists for the lifetime of this GitHub runner.
-          KEYCHAIN_PASSWORD="$(uuidgen)-$(uuidgen)"
-
-          # Make the keychain path available to later steps and to
-          # the always-running cleanup step.
-          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-
-          # Restore the P12 from the encrypted GitHub secret.
-          printf '%s' "$IOS_DEVELOPMENT_P12_BASE64" |
-              base64 -D \
-              > "$CERTIFICATE_PATH"
-
-          if [ ! -s "$CERTIFICATE_PATH" ]; then
-              echo "::error::Persistent Apple Development P12 could not be restored."
-              exit 1
+          if [[ ! -s "$certificate_path" ]]; then
+            echo "::error::Persistent Apple Development P12 could not be restored."
+            exit 1
           fi
 
-          chmod 600 "$CERTIFICATE_PATH"
+          chmod 600 "$certificate_path"
 
-          # Create and unlock a temporary keychain.
-          security create-keychain \
-              -p "$KEYCHAIN_PASSWORD" \
-              "$KEYCHAIN_PATH"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
 
-          security set-keychain-settings \
-              -lut 21600 \
-              "$KEYCHAIN_PATH"
+          security import "$certificate_path" \
+            -P "$IOS_DEVELOPMENT_P12_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
 
-          security unlock-keychain \
-              -p "$KEYCHAIN_PASSWORD" \
-              "$KEYCHAIN_PATH"
-
-          # Import certificate + private key.
-          security import \
-              "$CERTIFICATE_PATH" \
-              -P "$IOS_DEVELOPMENT_P12_PASSWORD" \
-              -A \
-              -t cert \
-              -f pkcs12 \
-              -k "$KEYCHAIN_PATH"
-
-          # Allow Apple/Xcode signing tools to access the private key
-          # non-interactively.
           security set-key-partition-list \
-              -S apple-tool:,apple: \
-              -k "$KEYCHAIN_PASSWORD" \
-              "$KEYCHAIN_PATH"
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path"
 
-          # Make this the keychain Xcode searches for signing identities.
-          security list-keychains \
-              -d user \
-              -s "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
 
-          security default-keychain \
-              -d user \
-              -s "$KEYCHAIN_PATH"
+          identity_output="$(security find-identity -v -p codesigning "$keychain_path")"
+          echo "$identity_output"
 
-          echo ""
-          echo "Signing identities available:"
-          echo ""
-
-          IDENTITY_OUTPUT=$(
-              security find-identity \
-                  -v \
-                  -p codesigning \
-                  "$KEYCHAIN_PATH"
-          )
-
-          echo "$IDENTITY_OUTPUT"
-
-          if ! echo "$IDENTITY_OUTPUT" |
-              grep -Fq "Apple Development"; then
-
-              echo ""
-              echo "::error::The imported P12 does not contain a usable Apple Development signing identity."
-              echo "::error::Make sure the P12 contains both the Apple Development certificate and its private key."
-
-              exit 1
-
+          if ! grep -Fq "Apple Development" <<< "$identity_output"; then
+            echo "::error::The P12 does not contain a usable Apple Development identity and private key."
+            exit 1
           fi
 
-          echo ""
+          echo "SIGNING_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
           echo "✓ Persistent Apple Development identity installed."
-          echo "✓ Xcode will reuse this identity instead of creating a new one."
 
+      - name: Prepare CocoaPods cache key
+        id: pods-cache-key
+        working-directory: ios-project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      # ============================================================
-      # 9. Install CocoaPods dependencies when required
-      # ============================================================
+          if [[ ! -f "Podfile" ]]; then
+            echo "has_podfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Podfile found. CocoaPods cache is not applicable."
+            exit 0
+          fi
+
+          # A package created on Windows must never supply a stale macOS Pods
+          # directory or generated workspace. The cache/pod install below owns
+          # these paths and recreates them deterministically from Podfile.lock.
+          if [[ -d "Pods" || -d "Unity-iPhone.xcworkspace" ]]; then
+            echo "Removing packaged/stale CocoaPods output before cache restore."
+            rm -rf "Pods" "Unity-iPhone.xcworkspace"
+          fi
+
+          pod_version="$(pod --version | tr -cd 'A-Za-z0-9._-')"
+          prefix="pods-v3-${RUNNER_OS}-${RUNNER_ARCH}-${APP_KEY}-xcode${XCODE_VERSION}-cocoapods${pod_version}-"
+
+          if [[ -f "Podfile.lock" ]]; then
+            input_kind="lock"
+            input_hash="$(shasum -a 256 Podfile.lock | awk '{print $1}')"
+          else
+            input_kind="podfile"
+            input_hash="$(shasum -a 256 Podfile | awk '{print $1}')"
+          fi
+
+          primary_key="${prefix}${input_kind}-${input_hash}"
+
+          echo "has_podfile=true" >> "$GITHUB_OUTPUT"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "primary_key=$primary_key" >> "$GITHUB_OUTPUT"
+          echo "CocoaPods cache primary key: $primary_key"
+
+      - name: Restore CocoaPods cache
+        id: pods-cache-restore
+        if: ${{ inputs.use_build_cache && steps.pods-cache-key.outputs.has_podfile == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ios-project/Pods
+          key: ${{ steps.pods-cache-key.outputs.primary_key }}
+          restore-keys: |
+            ${{ steps.pods-cache-key.outputs.prefix }}
+
+      - name: Recover from CocoaPods cache restore failure
+        if: ${{ inputs.use_build_cache && steps.pods-cache-restore.outcome == 'failure' }}
+        working-directory: ios-project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::warning::CocoaPods cache restore failed. Continuing with a clean dependency install."
+          rm -rf Pods
+          mkdir -p "$HOME/Library/Caches/CocoaPods"
 
       - name: Install CocoaPods dependencies
         working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [ ! -f "Podfile" ]; then
-
-              echo "No Podfile found."
-              echo "✓ CocoaPods not required."
-
-              exit 0
-
+          if [[ ! -f "Podfile" ]]; then
+            echo "No Podfile found. CocoaPods is not required."
+            exit 0
           fi
 
-          echo "Podfile found."
+          echo "CocoaPods version: $(pod --version)"
+          echo "Cache restore outcome: ${{ steps.pods-cache-restore.outcome }}"
+          echo "Cache exact hit: ${{ steps.pods-cache-restore.outputs.cache-hit }}"
+          echo "Cache matched key: ${{ steps.pods-cache-restore.outputs.cache-matched-key }}"
 
-          pod --version
-
-          echo ""
-
-          if [ -f "Podfile.lock" ]; then
-
-              echo "Podfile.lock found."
-              echo "Installing locked dependencies..."
-
-              pod install --deployment
-
+          if [[ -f "Podfile.lock" ]]; then
+            pod install --deployment
           else
-
-              echo "No Podfile.lock found."
-              echo "Resolving dependencies..."
-
-              pod install
-
+            pod install
           fi
 
-          echo ""
           echo "✓ CocoaPods dependencies installed."
 
-
-      # ============================================================
-      # 10. Restore Unix executable permissions
-      #
-      # Windows ZIP archives do not reliably preserve Unix executable
-      # permission bits. Unity/plugins may contain shell scripts that
-      # Xcode executes directly.
-      # ============================================================
-
-      - name: Restore script permissions
+      - name: Prepare CocoaPods cache save key
+        id: pods-cache-save-key
+        if: ${{ inputs.use_build_cache && steps.pods-cache-key.outputs.has_podfile == 'true' && steps.pods-cache-restore.outcome != 'failure' }}
         working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "Restoring executable permissions on shell scripts..."
-          echo ""
-
-          SCRIPT_COUNT=$(
-              find . \
-                  -type f \
-                  -name "*.sh" \
-                  | wc -l \
-                  | tr -d ' '
-          )
-
-          if [ "$SCRIPT_COUNT" -eq 0 ]; then
-              echo "No .sh files found."
-              echo "✓ No permissions needed restoring."
-              exit 0
+          if [[ -f "Podfile.lock" ]]; then
+            resolved_hash="$(shasum -a 256 Podfile.lock | awk '{print $1}')"
+            save_key="${{ steps.pods-cache-key.outputs.prefix }}lock-${resolved_hash}"
+          else
+            save_key="${{ steps.pods-cache-key.outputs.primary_key }}"
           fi
 
-          find . \
-              -type f \
-              -name "*.sh" \
-              -exec chmod +x {} +
+          echo "key=$save_key" >> "$GITHUB_OUTPUT"
+          echo "CocoaPods cache save key: $save_key"
 
-          echo "✓ Marked $SCRIPT_COUNT shell scripts executable."
+      - name: Save CocoaPods cache
+        if: ${{ inputs.use_build_cache && steps.pods-cache-save-key.outputs.key != '' && steps.pods-cache-save-key.outputs.key != steps.pods-cache-restore.outputs.cache-matched-key }}
+        continue-on-error: true
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ios-project/Pods
+          key: ${{ steps.pods-cache-save-key.outputs.key }}
 
-          echo ""
-          echo "Executable shell scripts:"
+      - name: Restore Unix executable permissions
+        working-directory: ios-project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-          find . \
-              -type f \
-              -name "*.sh" \
-              -exec ls -l {} \;
+          script_count="$(find . -type f -name '*.sh' | wc -l | tr -d ' ')"
+          if [[ "$script_count" -eq 0 ]]; then
+            echo "No shell scripts found."
+            exit 0
+          fi
 
-
-      # ============================================================
-      # 11. Determine .xcworkspace or .xcodeproj
-      # ============================================================
+          find . -type f -name '*.sh' -exec chmod +x {} +
+          echo "✓ Marked $script_count shell scripts executable."
 
       - name: Determine Xcode build container
         working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [ -d "Unity-iPhone.xcworkspace" ]; then
-
-              echo "Using:"
-              echo "Unity-iPhone.xcworkspace"
-
-              echo "XCODE_CONTAINER_TYPE=workspace" >> "$GITHUB_ENV"
-              echo "XCODE_CONTAINER=Unity-iPhone.xcworkspace" >> "$GITHUB_ENV"
-
+          if [[ -d "Unity-iPhone.xcworkspace" ]]; then
+            echo "XCODE_CONTAINER_TYPE=workspace" >> "$GITHUB_ENV"
+            echo "XCODE_CONTAINER=Unity-iPhone.xcworkspace" >> "$GITHUB_ENV"
+            echo "Using Unity-iPhone.xcworkspace"
           else
-
-              echo "Using:"
-              echo "Unity-iPhone.xcodeproj"
-
-              echo "XCODE_CONTAINER_TYPE=project" >> "$GITHUB_ENV"
-              echo "XCODE_CONTAINER=Unity-iPhone.xcodeproj" >> "$GITHUB_ENV"
-
+            echo "XCODE_CONTAINER_TYPE=project" >> "$GITHUB_ENV"
+            echo "XCODE_CONTAINER=Unity-iPhone.xcodeproj" >> "$GITHUB_ENV"
+            echo "Using Unity-iPhone.xcodeproj"
           fi
-
-
-      # ============================================================
-      # 12. Verify configured Xcode scheme
-      # ============================================================
 
       - name: Verify Xcode scheme
         working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          SCHEME_JSON="$RUNNER_TEMP/xcode-schemes.json"
+          scheme_json="$GITHUB_WORKSPACE/logs/xcode-schemes.json"
 
-          if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
-
-              xcodebuild \
-                  -workspace "$XCODE_CONTAINER" \
-                  -list \
-                  -json \
-                  > "$SCHEME_JSON"
-
+          if [[ "$XCODE_CONTAINER_TYPE" == "workspace" ]]; then
+            xcodebuild -workspace "$XCODE_CONTAINER" -list -json > "$scheme_json"
           else
-
-              xcodebuild \
-                  -project "$XCODE_CONTAINER" \
-                  -list \
-                  -json \
-                  > "$SCHEME_JSON"
-
+            xcodebuild -project "$XCODE_CONTAINER" -list -json > "$scheme_json"
           fi
 
-          export SCHEME_JSON
-          export XCODE_SCHEME
+          export scheme_json XCODE_SCHEME
 
           python3 <<'PY'
           import json
           import os
           import sys
 
-          with open(os.environ["SCHEME_JSON"], "r", encoding="utf-8") as handle:
+          with open(os.environ["scheme_json"], "r", encoding="utf-8") as handle:
               data = json.load(handle)
 
           container = data.get("workspace") or data.get("project") or {}
           schemes = container.get("schemes", [])
-
           expected = os.environ["XCODE_SCHEME"]
 
           print("Available schemes:")
-
           for scheme in schemes:
               print(f"  - {scheme}")
 
-          print()
-
           if expected not in schemes:
-              print(f"::error::Configured Xcode scheme '{expected}' was not found.")
+              print(f"::error::Configured Xcode scheme {expected!r} was not found.")
               sys.exit(1)
 
           print(f"✓ Scheme verified: {expected}")
           PY
 
-
-      # ============================================================
-      # 13. Verify bundle identifier
-      # ============================================================
-
       - name: Verify app identity
         working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          SETTINGS_FILE="$RUNNER_TEMP/build-settings.txt"
+          settings_file="$GITHUB_WORKSPACE/logs/app-build-settings.txt"
 
-          if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
-
-              xcodebuild \
-                  -workspace "$XCODE_CONTAINER" \
-                  -scheme "$XCODE_SCHEME" \
-                  -configuration Release \
-                  -destination "generic/platform=iOS" \
-                  -showBuildSettings \
-                  > "$SETTINGS_FILE"
-
+          if [[ "$XCODE_CONTAINER_TYPE" == "workspace" ]]; then
+            xcodebuild \
+              -workspace "$XCODE_CONTAINER" \
+              -scheme "$XCODE_SCHEME" \
+              -configuration Release \
+              -destination "generic/platform=iOS" \
+              -showBuildSettings > "$settings_file"
           else
-
-              xcodebuild \
-                  -project "$XCODE_CONTAINER" \
-                  -scheme "$XCODE_SCHEME" \
-                  -configuration Release \
-                  -destination "generic/platform=iOS" \
-                  -showBuildSettings \
-                  > "$SETTINGS_FILE"
-
+            xcodebuild \
+              -project "$XCODE_CONTAINER" \
+              -scheme "$XCODE_SCHEME" \
+              -configuration Release \
+              -destination "generic/platform=iOS" \
+              -showBuildSettings > "$settings_file"
           fi
 
-          echo "Bundle identifiers found in scheme:"
-          echo ""
+          bundle_ids="$(sed -n 's/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = //p' "$settings_file" | sort -u)"
 
-          BUNDLE_IDS=$(
-              sed -n \
-                  's/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = //p' \
-                  "$SETTINGS_FILE" |
-              sort -u
-          )
+          echo "Bundle identifiers found:"
+          printf '%s\n' "$bundle_ids" | sed 's/^/  /'
 
-          if [ -z "$BUNDLE_IDS" ]; then
-
-              echo "::error::No PRODUCT_BUNDLE_IDENTIFIER could be determined."
-              exit 1
-
+          if [[ -z "$bundle_ids" ]]; then
+            echo "::error::No PRODUCT_BUNDLE_IDENTIFIER could be determined."
+            exit 1
           fi
 
-          echo "$BUNDLE_IDS" |
-              sed 's/^/  /'
-
-          echo ""
-
-          if ! echo "$BUNDLE_IDS" |
-              grep -Fqx "$EXPECTED_BUNDLE_ID"; then
-
-              echo "::error::Bundle identifier mismatch."
-              echo ""
-              echo "Expected:"
-              echo "  $EXPECTED_BUNDLE_ID"
-              echo ""
-              echo "The selected GitHub Environment does not match this Unity iOS build."
-
-              exit 1
-
+          if ! grep -Fqx "$EXPECTED_BUNDLE_ID" <<< "$bundle_ids"; then
+            echo "::error::Bundle identifier mismatch. Expected $EXPECTED_BUNDLE_ID."
+            exit 1
           fi
 
           echo "✓ App identity verified."
-          echo ""
-          echo "App:"
-          echo "  $APP_DISPLAY_NAME"
-          echo ""
-          echo "Bundle:"
-          echo "  $EXPECTED_BUNDLE_ID"
 
-
-      # ============================================================
-      # 14. Prepare build logs
-      # ============================================================
-
-      - name: Prepare build logs
+      - name: Preflight local Apple frameworks and entitlements
+        working-directory: ios-project
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/logs"
+          framework_settings="$GITHUB_WORKSPACE/logs/unityframework-build-settings.txt"
+          needs_apple_core=0
+          needs_gamekit=0
 
+          if [[ -d "ApplePluginLibraries/Apple.Core/AppleCoreNative.framework" ]]; then
+            needs_apple_core=1
+            test -f "ApplePluginLibraries/Apple.Core/AppleCoreNative.framework/AppleCoreNative" || {
+              echo "::error::AppleCoreNative.framework exists but its binary is missing."
+              exit 1
+            }
+          fi
 
-      # ============================================================
-      # 15. Archive the application
-      #
-      # Automatic provisioning remains enabled.
-      #
-      # Difference from the old workflow:
-      # Xcode now already has our persistent Apple Development
-      # identity and private key available in its keychain.
-      # ============================================================
+          if [[ -d "ApplePluginLibraries/Apple.GameKit/GameKitWrapper.framework" ]]; then
+            needs_gamekit=1
+            test -f "ApplePluginLibraries/Apple.GameKit/GameKitWrapper.framework/GameKitWrapper" || {
+              echo "::error::GameKitWrapper.framework exists but its binary is missing."
+              exit 1
+            }
+          fi
+
+          if [[ "$needs_apple_core" -eq 0 && "$needs_gamekit" -eq 0 ]]; then
+            echo "No local Apple plugin frameworks require preflight."
+            exit 0
+          fi
+
+          xcodebuild \
+            -project Unity-iPhone.xcodeproj \
+            -target UnityFramework \
+            -configuration Release \
+            -showBuildSettings > "$framework_settings"
+
+          if [[ "$needs_apple_core" -eq 1 ]]; then
+            if ! grep -Fq "ApplePluginLibraries/Apple.Core" "$framework_settings"; then
+              echo "::error::UnityFramework cannot resolve AppleCoreNative.framework."
+              echo "::error::Its effective FRAMEWORK_SEARCH_PATHS do not include ApplePluginLibraries/Apple.Core."
+              exit 1
+            fi
+            echo "✓ UnityFramework can resolve AppleCoreNative.framework."
+          fi
+
+          if [[ "$needs_gamekit" -eq 1 ]]; then
+            if ! grep -Fq "ApplePluginLibraries/Apple.GameKit" "$framework_settings"; then
+              echo "::error::UnityFramework cannot resolve GameKitWrapper.framework."
+              echo "::error::Its effective FRAMEWORK_SEARCH_PATHS do not include ApplePluginLibraries/Apple.GameKit."
+              exit 1
+            fi
+
+            game_center_entitlement=""
+            while IFS= read -r -d '' entitlements_file; do
+              if grep -Fq 'com.apple.developer.game-center' "$entitlements_file"; then
+                game_center_entitlement="$entitlements_file"
+                break
+              fi
+            done < <(find . -type f -name '*.entitlements' -print0)
+
+            if [[ -z "$game_center_entitlement" ]]; then
+              echo "::error::GameKitWrapper is present, but no entitlements file declares com.apple.developer.game-center."
+              exit 1
+            fi
+
+            echo "✓ UnityFramework can resolve GameKitWrapper.framework."
+            echo "✓ Game Center entitlement found: $game_center_entitlement"
+          fi
+
+          echo "Local framework architectures:"
+          [[ "$needs_apple_core" -eq 1 ]] && lipo -info "ApplePluginLibraries/Apple.Core/AppleCoreNative.framework/AppleCoreNative" || true
+          [[ "$needs_gamekit" -eq 1 ]] && lipo -info "ApplePluginLibraries/Apple.GameKit/GameKitWrapper.framework/GameKitWrapper" || true
+
+      - name: Remove incompatible packaged IL2CPP cache
+        working-directory: ios-project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "Il2CppTempDirArtifacts"
+          mkdir -p "Il2CppTempDirArtifacts/Release/artifacts/arm64"
+          echo "Prepared clean macOS IL2CPP cache destination."
+
+      - name: Restore IL2CPP and Bee cache
+        id: il2cpp-cache-restore
+        if: ${{ inputs.use_build_cache }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: ios-project/Il2CppTempDirArtifacts/Release/artifacts/arm64
+          key: il2cpp-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.app }}-unity${{ inputs.unity_version }}-xcode${{ inputs.xcode_version }}-${{ inputs.native_source_sha256 }}
+          restore-keys: |
+            il2cpp-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.app }}-unity${{ inputs.unity_version }}-xcode${{ inputs.xcode_version }}-
+
+      - name: Recover from IL2CPP cache restore failure
+        if: ${{ inputs.use_build_cache && steps.il2cpp-cache-restore.outcome == 'failure' }}
+        working-directory: ios-project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::warning::IL2CPP cache restore failed. Continuing with a clean native build."
+          rm -rf "Il2CppTempDirArtifacts/Release/artifacts/arm64"
+          mkdir -p "Il2CppTempDirArtifacts/Release/artifacts/arm64"
+
+      - name: Report restored caches
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Build caches enabled: $USE_BUILD_CACHE"
+          echo "CocoaPods restore outcome: ${{ steps.pods-cache-restore.outcome }}"
+          echo "CocoaPods exact hit:  ${{ steps.pods-cache-restore.outputs.cache-hit }}"
+          echo "CocoaPods matched key: ${{ steps.pods-cache-restore.outputs.cache-matched-key }}"
+          echo "IL2CPP restore outcome: ${{ steps.il2cpp-cache-restore.outcome }}"
+          echo "IL2CPP exact hit:      ${{ steps.il2cpp-cache-restore.outputs.cache-hit }}"
+          echo "IL2CPP matched key:    ${{ steps.il2cpp-cache-restore.outputs.cache-matched-key }}"
+          echo ""
+
+          if [[ -d "ios-project/Il2CppTempDirArtifacts/Release/artifacts/arm64" ]]; then
+            echo "Restored IL2CPP cache size:"
+            du -sh "ios-project/Il2CppTempDirArtifacts/Release/artifacts/arm64" || true
+          fi
+
+          echo "PODS_CACHE_HIT=${{ steps.pods-cache-restore.outputs.cache-hit }}" >> "$GITHUB_ENV"
+          echo "PODS_CACHE_MATCHED_KEY=${{ steps.pods-cache-restore.outputs.cache-matched-key }}" >> "$GITHUB_ENV"
+          echo "IL2CPP_CACHE_HIT=${{ steps.il2cpp-cache-restore.outputs.cache-hit }}" >> "$GITHUB_ENV"
+          echo "IL2CPP_CACHE_MATCHED_KEY=${{ steps.il2cpp-cache-restore.outputs.cache-matched-key }}" >> "$GITHUB_ENV"
+
+      - name: Prepare build logs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs" "$GITHUB_WORKSPACE/export"
 
       - name: Archive iOS app
         working-directory: ios-project
@@ -793,377 +913,439 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          ARCHIVE_PATH="$RUNNER_TEMP/AppStore-${REQUEST_ID}.xcarchive"
+          archive_path="$RUNNER_TEMP/AppStore-${REQUEST_ID}.xcarchive"
+          started_at="$(date +%s)"
 
           echo "=========================================="
-          echo "Archiving"
+          echo "Archiving $APP_DISPLAY_NAME"
           echo "=========================================="
+          echo "Bundle:  $EXPECTED_BUNDLE_ID"
+          echo "Request: $REQUEST_ID"
           echo ""
-          echo "$APP_DISPLAY_NAME"
-          echo "$EXPECTED_BUNDLE_ID"
-          echo ""
-
           echo "Available signing identities:"
-          security find-identity \
-              -v \
-              -p codesigning \
-              "$SIGNING_KEYCHAIN_PATH"
-
+          security find-identity -v -p codesigning "$SIGNING_KEYCHAIN_PATH"
           echo ""
 
-          if [ "$XCODE_CONTAINER_TYPE" = "workspace" ]; then
-
-              xcodebuild \
-                  -workspace "$XCODE_CONTAINER" \
-                  -scheme "$XCODE_SCHEME" \
-                  -configuration Release \
-                  -destination "generic/platform=iOS" \
-                  -archivePath "$ARCHIVE_PATH" \
-                  -allowProvisioningUpdates \
-                  -authenticationKeyPath "$ASC_KEY_PATH" \
-                  -authenticationKeyID "$ASC_KEY_ID" \
-                  -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-                  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-                  CODE_SIGN_STYLE=Automatic \
-                  clean archive \
-                  2>&1 |
-                  tee "$GITHUB_WORKSPACE/logs/archive.log"
-
+          if [[ "$XCODE_CONTAINER_TYPE" == "workspace" ]]; then
+            container_args=(-workspace "$XCODE_CONTAINER")
           else
-
-              xcodebuild \
-                  -project "$XCODE_CONTAINER" \
-                  -scheme "$XCODE_SCHEME" \
-                  -configuration Release \
-                  -destination "generic/platform=iOS" \
-                  -archivePath "$ARCHIVE_PATH" \
-                  -allowProvisioningUpdates \
-                  -authenticationKeyPath "$ASC_KEY_PATH" \
-                  -authenticationKeyID "$ASC_KEY_ID" \
-                  -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-                  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-                  CODE_SIGN_STYLE=Automatic \
-                  clean archive \
-                  2>&1 |
-                  tee "$GITHUB_WORKSPACE/logs/archive.log"
-
+            container_args=(-project "$XCODE_CONTAINER")
           fi
 
-          if [ ! -d "$ARCHIVE_PATH" ]; then
+          set +e
+          xcodebuild \
+            "${container_args[@]}" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$archive_path" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            archive \
+            2>&1 | tee "$GITHUB_WORKSPACE/logs/archive.log"
+          status=${PIPESTATUS[0]}
+          set -e
 
-              echo "::error::Xcode reported success but no archive was created."
-              exit 1
+          ended_at="$(date +%s)"
+          duration="$((ended_at - started_at))"
+          echo "ARCHIVE_SECONDS=$duration" >> "$GITHUB_ENV"
 
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Xcode archive failed after ${duration}s with exit code $status."
+            exit "$status"
           fi
 
-          echo ""
-          echo "✓ Archive created."
-          echo ""
+          if [[ ! -d "$archive_path" ]]; then
+            echo "::error::Xcode reported success but no archive was created."
+            exit 1
+          fi
 
-          du -sh "$ARCHIVE_PATH"
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+          echo "✓ Archive created in ${duration}s."
+          du -sh "$archive_path"
 
-          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+      - name: Analyze IL2CPP cache effectiveness
+        id: il2cpp-analysis
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
+          archive_log="$GITHUB_WORKSPACE/logs/archive.log"
+          dag_reused="unknown"
+          graph_line="not reported"
+          future_warnings=0
 
-      # ============================================================
-      # 16. Read final metadata from archive
-      # ============================================================
+          if [[ -f "$archive_log" ]]; then
+            if grep -Fq "bee.dag couldn't be loaded" "$archive_log"; then
+              dag_reused="false"
+            elif grep -Fq "bee_backend" "$archive_log"; then
+              dag_reused="true"
+            fi
+
+            graph_line="$(grep -F 'Finished compiling graph:' "$archive_log" | tail -1 || true)"
+            graph_line="${graph_line//$'\r'/}"
+            [[ -n "$graph_line" ]] || graph_line="not reported"
+            future_warnings="$(grep -c -F 'timestamp is in the future' "$archive_log" || true)"
+          fi
+
+          echo "Bee DAG reused: $dag_reused"
+          echo "IL2CPP graph: $graph_line"
+          echo "Future timestamp warnings during Archive: $future_warnings"
+
+          if [[ "$future_warnings" -gt 0 ]]; then
+            echo "::warning::Bee still reported $future_warnings future-timestamp inputs. The timestamp normalization needs review."
+          fi
+
+          if [[ -n "${IL2CPP_CACHE_MATCHED_KEY:-}" && "$dag_reused" == "false" ]]; then
+            echo "::warning::An IL2CPP cache was restored, but Bee rejected its DAG and performed a cold graph setup."
+          fi
+
+          echo "BEE_DAG_REUSED=$dag_reused" >> "$GITHUB_ENV"
+          echo "BEE_FUTURE_WARNINGS=$future_warnings" >> "$GITHUB_ENV"
+          {
+            echo "BEE_GRAPH_LINE<<EOF"
+            echo "$graph_line"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Inspect IL2CPP cache after archive
+        id: il2cpp-cache-size
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cache_path="ios-project/Il2CppTempDirArtifacts/Release/artifacts/arm64"
+          max_cache_bytes=$((8 * 1024 * 1024 * 1024))
+          save_allowed=false
+          size_bytes=0
+
+          if [[ -d "$cache_path" ]]; then
+            size_kib="$(du -sk "$cache_path" | awk '{print $1}')"
+            size_bytes="$((size_kib * 1024))"
+            du -sh "$cache_path"
+
+            if [[ "$size_bytes" -gt 0 && "$size_bytes" -le "$max_cache_bytes" ]]; then
+              save_allowed=true
+            elif [[ "$size_bytes" -gt "$max_cache_bytes" ]]; then
+              echo "::warning::IL2CPP cache is larger than 8 GiB and will not be uploaded."
+            fi
+          else
+            echo "No IL2CPP cache directory was produced."
+          fi
+
+          echo "IL2CPP_CACHE_BYTES=$size_bytes" >> "$GITHUB_ENV"
+          echo "size_bytes=$size_bytes" >> "$GITHUB_OUTPUT"
+          echo "save_allowed=$save_allowed" >> "$GITHUB_OUTPUT"
+          echo "IL2CPP cache upload allowed: $save_allowed"
+
+      - name: Save IL2CPP and Bee cache
+        if: ${{ success() && inputs.use_build_cache && steps.il2cpp-cache-restore.outcome != 'failure' && steps.il2cpp-cache-size.outputs.save_allowed == 'true' && steps.il2cpp-cache-restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: ios-project/Il2CppTempDirArtifacts/Release/artifacts/arm64
+          key: ${{ steps.il2cpp-cache-restore.outputs.cache-primary-key }}
 
       - name: Read archive metadata
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          APP_INFO=$(
-              find "$ARCHIVE_PATH/Products/Applications" \
-                  -maxdepth 2 \
-                  -name Info.plist \
-                  -print \
-                  -quit
-          )
-
-          if [ -z "$APP_INFO" ]; then
-
-              echo "::error::Could not locate the archived application's Info.plist."
-              exit 1
-
+          app_info="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 2 -name Info.plist -print -quit)"
+          if [[ -z "$app_info" ]]; then
+            echo "::error::Could not locate the archived application's Info.plist."
+            exit 1
           fi
 
-          ARCHIVE_BUNDLE_ID=$(
-              /usr/libexec/PlistBuddy \
-                  -c "Print :CFBundleIdentifier" \
-                  "$APP_INFO"
-          )
+          archive_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_info")"
+          archive_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_info")"
+          archive_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_info")"
 
-          ARCHIVE_VERSION=$(
-              /usr/libexec/PlistBuddy \
-                  -c "Print :CFBundleShortVersionString" \
-                  "$APP_INFO"
-          )
-
-          ARCHIVE_BUILD=$(
-              /usr/libexec/PlistBuddy \
-                  -c "Print :CFBundleVersion" \
-                  "$APP_INFO"
-          )
-
-          echo "Archive:"
-          echo ""
-          echo "  App:      $APP_DISPLAY_NAME"
-          echo "  Bundle:   $ARCHIVE_BUNDLE_ID"
-          echo "  Version:  $ARCHIVE_VERSION"
-          echo "  Build:    $ARCHIVE_BUILD"
-
-          if [ "$ARCHIVE_BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]; then
-
-              echo ""
-              echo "::error::Archived bundle identifier changed unexpectedly."
-              exit 1
-
+          if [[ "$archive_bundle_id" != "$EXPECTED_BUNDLE_ID" ]]; then
+            echo "::error::Archived bundle identifier changed unexpectedly: $archive_bundle_id"
+            exit 1
           fi
 
-          echo ""
+          echo "ARCHIVE_VERSION=$archive_version" >> "$GITHUB_ENV"
+          echo "ARCHIVE_BUILD=$archive_build" >> "$GITHUB_ENV"
 
-          echo "ARCHIVE_VERSION=$ARCHIVE_VERSION" >> "$GITHUB_ENV"
-          echo "ARCHIVE_BUILD=$ARCHIVE_BUILD" >> "$GITHUB_ENV"
-
-
-      # ============================================================
-      # 17. Create App Store export configuration
-      # ============================================================
+          echo "Archive metadata:"
+          echo "  App:     $APP_DISPLAY_NAME"
+          echo "  Bundle:  $archive_bundle_id"
+          echo "  Version: $archive_version"
+          echo "  Build:   $archive_build"
 
       - name: Create App Store export configuration
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
 
-          cat > "$EXPORT_OPTIONS" <<EOF
+          cat > "$export_options" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-
-              <key>method</key>
-              <string>app-store-connect</string>
-
-              <key>teamID</key>
-              <string>${APPLE_TEAM_ID}</string>
-
-              <key>signingStyle</key>
-              <string>automatic</string>
-
-              <key>uploadSymbols</key>
-              <true/>
-
-              <key>stripSwiftSymbols</key>
-              <true/>
-
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>stripSwiftSymbols</key>
+            <true/>
           </dict>
           </plist>
           EOF
 
-          echo "EXPORT_OPTIONS=$EXPORT_OPTIONS" >> "$GITHUB_ENV"
-
-          echo "✓ App Store export configuration created."
-
-
-      # ============================================================
-      # 18. Export signed IPA
-      # ============================================================
+          echo "EXPORT_OPTIONS=$export_options" >> "$GITHUB_ENV"
+          echo "✓ Export configuration created."
 
       - name: Export signed IPA
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        shell: bash
         run: |
           set -Eeuo pipefail
 
-          EXPORT_PATH="$GITHUB_WORKSPACE/export"
+          export_path="$GITHUB_WORKSPACE/export"
+          started_at="$(date +%s)"
 
-          mkdir -p "$EXPORT_PATH"
-
-          echo "=========================================="
-          echo "Exporting IPA"
-          echo "=========================================="
-          echo ""
-
+          set +e
           xcodebuild \
-              -exportArchive \
-              -archivePath "$ARCHIVE_PATH" \
-              -exportPath "$EXPORT_PATH" \
-              -exportOptionsPlist "$EXPORT_OPTIONS" \
-              -allowProvisioningUpdates \
-              -authenticationKeyPath "$ASC_KEY_PATH" \
-              -authenticationKeyID "$ASC_KEY_ID" \
-              -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-              2>&1 |
-              tee "$GITHUB_WORKSPACE/logs/export.log"
+            -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$export_path" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee "$GITHUB_WORKSPACE/logs/export.log"
+          status=${PIPESTATUS[0]}
+          set -e
 
-          IPA_PATH=$(
-              find "$EXPORT_PATH" \
-                  -maxdepth 1 \
-                  -type f \
-                  -name "*.ipa" \
-                  -print \
-                  -quit
-          )
+          ended_at="$(date +%s)"
+          duration="$((ended_at - started_at))"
+          echo "EXPORT_SECONDS=$duration" >> "$GITHUB_ENV"
 
-          if [ -z "$IPA_PATH" ]; then
-
-              echo ""
-              echo "::error::No IPA was produced."
-              exit 1
-
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::IPA export failed after ${duration}s with exit code $status."
+            exit "$status"
           fi
 
-          echo ""
-          echo "✓ IPA exported."
-          echo ""
+          ipa_path="$(find "$export_path" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          if [[ -z "$ipa_path" ]]; then
+            echo "::error::No IPA was produced."
+            exit 1
+          fi
 
-          ls -lh "$IPA_PATH"
-
-          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
-
-
-      # ============================================================
-      # 19. Upload directly to App Store Connect
-      # ============================================================
+          echo "IPA_PATH=$ipa_path" >> "$GITHUB_ENV"
+          echo "✓ IPA exported in ${duration}s."
+          ls -lh "$ipa_path"
 
       - name: Upload to App Store Connect
+        if: ${{ inputs.upload_to_app_store }}
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        shell: bash
         run: |
           set -Eeuo pipefail
+
+          started_at="$(date +%s)"
 
           echo "=========================================="
           echo "Uploading to App Store Connect"
           echo "=========================================="
-          echo ""
-          echo "App:      $APP_DISPLAY_NAME"
-          echo "Version:  $ARCHIVE_VERSION"
-          echo "Build:    $ARCHIVE_BUILD"
-          echo ""
+          echo "App:     $APP_DISPLAY_NAME"
+          echo "Version: $ARCHIVE_VERSION"
+          echo "Build:   $ARCHIVE_BUILD"
 
+          set +e
           API_PRIVATE_KEYS_DIR="$API_PRIVATE_KEYS_DIR" \
           xcrun altool \
-              --upload-app \
-              -f "$IPA_PATH" \
-              -t ios \
-              --apiKey "$ASC_KEY_ID" \
-              --apiIssuer "$ASC_ISSUER_ID" \
-              2>&1 |
-              tee "$GITHUB_WORKSPACE/logs/upload.log"
+            --upload-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            2>&1 | tee "$GITHUB_WORKSPACE/logs/upload.log"
+          status=${PIPESTATUS[0]}
+          set -e
 
-          echo ""
+          ended_at="$(date +%s)"
+          duration="$((ended_at - started_at))"
+          echo "UPLOAD_SECONDS=$duration" >> "$GITHUB_ENV"
+
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::App Store Connect upload failed after ${duration}s with exit code $status."
+            exit "$status"
+          fi
+
+          echo "✓ Upload completed in ${duration}s."
+
+      - name: Report archive-only mode
+        if: ${{ ! inputs.upload_to_app_store }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "UPLOAD_SECONDS=0" >> "$GITHUB_ENV"
+          echo "Archive-only mode requested. IPA was not uploaded to App Store Connect."
+
+      - name: Print failure diagnostic summary
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
           echo "=========================================="
-          echo "✓ UPLOAD COMPLETE"
+          echo "Failure diagnostic summary"
           echo "=========================================="
+          echo "Caller repository: $GITHUB_REPOSITORY"
+          echo "App:               $APP_DISPLAY_NAME ($APP_KEY)"
+          echo "Request:           $REQUEST_ID"
+          echo "Core version:      $BUILDER_CORE_VERSION"
+          echo "Caches enabled:    $USE_BUILD_CACHE"
           echo ""
-          echo "$APP_DISPLAY_NAME"
-          echo "Version $ARCHIVE_VERSION"
-          echo "Build $ARCHIVE_BUILD"
+
+          shopt -s nullglob
+          log_files=("$GITHUB_WORKSPACE"/logs/*.log)
+
+          if [[ "${#log_files[@]}" -eq 0 ]]; then
+            echo "No Xcode log file exists. The failure happened before Archive/Export/Upload."
+          else
+            for log_file in "${log_files[@]}"; do
+              echo ""
+              echo "----- $(basename "$log_file"): likely errors -----"
+              grep -E -i                 '(^|[^a-z])(error:|fatal error:|archive failed|export failed|upload failed|framework .* not found|no profiles for|permission denied|command .* failed|process completed with exit code)'                 "$log_file" | tail -80 || true
+
+              echo ""
+              echo "----- $(basename "$log_file"): final 160 lines -----"
+              tail -160 "$log_file" || true
+            done
+          fi
+
           echo ""
-          echo "Apple will now process the build for TestFlight."
+          echo "A three-day diagnostics artifact will be uploaded when files are available."
 
-
-      # ============================================================
-      # 20. Save IPA and diagnostic logs
-      # ============================================================
-
-      - name: Save build artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
         with:
-          name: "${{ inputs.app }}-${{ inputs.request_id }}"
+          name: diagnostics-${{ inputs.app }}-${{ inputs.request_id }}
           path: |
-            export/*.ipa
+            logs/*
             export/DistributionSummary.plist
             export/Packaging.log
-            logs/*.log
-          if-no-files-found: warn
-          retention-days: 14
+            ios-project/tidvis-build.json
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 6
 
-
-      # ============================================================
-      # 21. Human-readable GitHub summary
-      # ============================================================
+      - name: Upload optional successful IPA
+        if: ${{ success() && inputs.keep_ipa_artifact }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+          archive: false
 
       - name: Write build summary
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
+          PODS_EXACT_HIT: ${{ steps.pods-cache-restore.outputs.cache-hit }}
+          PODS_MATCHED_KEY: ${{ steps.pods-cache-restore.outputs.cache-matched-key }}
+          IL2CPP_EXACT_HIT: ${{ steps.il2cpp-cache-restore.outputs.cache-hit }}
+          IL2CPP_MATCHED_KEY: ${{ steps.il2cpp-cache-restore.outputs.cache-matched-key }}
+        shell: bash
         run: |
+          total_seconds="unknown"
+          if [[ "${BUILDER_STARTED_EPOCH:-}" =~ ^[0-9]+$ ]]; then
+            total_seconds="$(( $(date +%s) - BUILDER_STARTED_EPOCH ))"
+          fi
+
           {
-              echo "# iOS App Store Build"
-              echo ""
-              echo "| | |"
-              echo "|---|---|"
-              echo "| App | ${APP_DISPLAY_NAME:-${{ inputs.app }}} |"
-              echo "| Environment | \`${{ inputs.app }}\` |"
-              echo "| Bundle ID | \`${EXPECTED_BUNDLE_ID:-unknown}\` |"
-              echo "| Request | \`${REQUEST_ID}\` |"
-              echo "| Input | \`${INPUT_ASSET_NAME}\` |"
-              echo "| Status | **${JOB_STATUS}** |"
+            echo "# iOS App Store Build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Status | **${JOB_STATUS}** |"
+            echo "| Builder core | \`${BUILDER_CORE_VERSION}\` |"
+            echo "| Caller repository | \`${GITHUB_REPOSITORY}\` |"
+            echo "| App | ${APP_DISPLAY_NAME} |"
+            echo "| App key | \`${APP_KEY}\` |"
+            echo "| Bundle ID | \`${EXPECTED_BUNDLE_ID}\` |"
+            echo "| Unity | \`${UNITY_VERSION}\` |"
+            echo "| Xcode | \`${XCODE_VERSION}\` |"
+            echo "| Request | \`${REQUEST_ID}\` |"
+            echo "| Input | \`${INPUT_ASSET_NAME}\` |"
+            echo "| Content SHA | \`${INPUT_CONTENT_SHA256}\` |"
+            echo "| IL2CPP source SHA | \`${INPUT_NATIVE_SOURCE_SHA256}\` |"
+            echo "| Corrected future timestamps | ${FUTURE_TIMESTAMP_COUNT:-unknown} |"
+            echo "| CocoaPods exact cache hit | ${PODS_EXACT_HIT:-false} |"
+            echo "| CocoaPods matched key | \`${PODS_MATCHED_KEY:-none}\` |"
+            echo "| IL2CPP exact cache hit | ${IL2CPP_EXACT_HIT:-false} |"
+            echo "| IL2CPP matched key | \`${IL2CPP_MATCHED_KEY:-none}\` |"
+            echo "| IL2CPP cache size | ${IL2CPP_CACHE_BYTES:-unknown} bytes |"
+            echo "| Bee DAG reused | ${BEE_DAG_REUSED:-unknown} |"
+            echo "| Bee future-timestamp warnings | ${BEE_FUTURE_WARNINGS:-unknown} |"
+            echo "| IL2CPP graph | \`${BEE_GRAPH_LINE:-not reported}\` |"
+            echo "| Total workflow duration | ${total_seconds}s |"
+            echo "| Archive duration | ${ARCHIVE_SECONDS:-unknown}s |"
+            echo "| Export duration | ${EXPORT_SECONDS:-unknown}s |"
+            echo "| Upload duration | ${UPLOAD_SECONDS:-not-run}s |"
+            echo "| Upload requested | ${UPLOAD_TO_APP_STORE} |"
+            echo "| Build caches enabled | ${USE_BUILD_CACHE} |"
 
-              if [ -n "${ARCHIVE_VERSION:-}" ]; then
-                  echo "| Version | ${ARCHIVE_VERSION} |"
-              fi
+            if [[ -n "${ARCHIVE_VERSION:-}" ]]; then
+              echo "| Version | ${ARCHIVE_VERSION} |"
+            fi
+            if [[ -n "${ARCHIVE_BUILD:-}" ]]; then
+              echo "| Build | ${ARCHIVE_BUILD} |"
+            fi
 
-              if [ -n "${ARCHIVE_BUILD:-}" ]; then
-                  echo "| Build | ${ARCHIVE_BUILD} |"
-              fi
-
-              echo ""
-
-              if [ "$JOB_STATUS" = "success" ]; then
-
-                  echo "## ✅ Uploaded to App Store Connect"
-                  echo ""
-                  echo "Apple will now process this build for TestFlight."
-
-              else
-
-                  echo "## ❌ Build failed"
-                  echo ""
-                  echo "Check the failed workflow step and the saved build logs."
-
-              fi
-
+            echo ""
+            if [[ "$JOB_STATUS" == "success" && "$UPLOAD_TO_APP_STORE" == "true" ]]; then
+              echo "## ✅ Uploaded to App Store Connect"
+              echo "Apple will now process the build for TestFlight."
+            elif [[ "$JOB_STATUS" == "success" ]]; then
+              echo "## ✅ Archive and IPA export succeeded"
+              echo "Upload was intentionally skipped."
+            else
+              echo "## ❌ Build failed"
+              echo "Open the failed step and download the three-day diagnostics artifact."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-
-      # ============================================================
-      # 22. Clean up temporary signing material
-      #
-      # GitHub-hosted runners are destroyed after the job anyway,
-      # but explicitly removing our temporary keychain/P12 keeps the
-      # workflow tidy and also makes it safer if this is ever adapted
-      # to a persistent runner.
-      # ============================================================
-
-      - name: Clean up signing identity
+      - name: Clean temporary signing material
         if: always()
+        shell: bash
         run: |
           set +e
 
-          echo "Cleaning temporary signing material..."
-
-          if [ -n "${SIGNING_KEYCHAIN_PATH:-}" ] &&
-             [ -f "$SIGNING_KEYCHAIN_PATH" ]; then
-
-              security delete-keychain \
-                  "$SIGNING_KEYCHAIN_PATH" \
-                  >/dev/null 2>&1 || true
-
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" && -f "$SIGNING_KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" >/dev/null 2>&1 || true
           fi
 
-          rm -f \
-              "$RUNNER_TEMP/ios-development.p12"
-
+          rm -f "$RUNNER_TEMP/ios-development.p12"
+          rm -rf "$RUNNER_TEMP/appstore-key"
           echo "✓ Temporary signing material cleaned."
