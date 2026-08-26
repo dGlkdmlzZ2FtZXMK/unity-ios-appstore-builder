@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 45
 
     env:
-      BUILDER_CORE_VERSION: "2.3.0"
+      BUILDER_CORE_VERSION: "2.3.3"
       RELEASE_TAG: ios-inputs
 
       APP_KEY: ${{ inputs.app }}
@@ -333,17 +333,272 @@ jobs:
           fi
 
           export API_PRIVATE_KEYS_DIR="$key_dir"
+          export ASC_KEY_ID ASC_ISSUER_ID
+          export ASC_KEY_PATH="$key_path"
 
-          if ! xcrun altool \
-            --list-providers \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID" \
-            > "$GITHUB_WORKSPACE/logs/asc-auth-probe.log" 2>&1; then
-            echo "::error::App Store Connect authentication failed."
-            echo "::error::Verify ASC_KEY_ID, ASC_ISSUER_ID, and ASC_PRIVATE_KEY_BASE64."
-            tail -80 "$GITHUB_WORKSPACE/logs/asc-auth-probe.log" || true
+          # altool --list-providers does not support API-key authentication.
+          # Validate the same key correctly against the App Store Connect REST
+          # API before downloading the Unity package or running CocoaPods.
+          token_path="$RUNNER_TEMP/asc-auth-token.jwt"
+          response_path="$GITHUB_WORKSPACE/logs/asc-auth-response.json"
+          curl_log="$GITHUB_WORKSPACE/logs/asc-auth-curl.log"
+          trap 'rm -f "${token_path:-}"' EXIT
+
+          python3 <<'PY' > "$token_path"
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+
+          def b64url(data):
+              return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+          def read_der_length(data, offset):
+              if offset >= len(data):
+                  raise ValueError("unexpected end of DER signature")
+
+              first = data[offset]
+              offset += 1
+
+              if first < 0x80:
+                  return first, offset
+
+              count = first & 0x7F
+              if count == 0 or count > 4 or offset + count > len(data):
+                  raise ValueError("invalid DER length")
+
+              length = int.from_bytes(data[offset:offset + count], "big")
+              return length, offset + count
+
+          def read_der_integer(data, offset):
+              if offset >= len(data) or data[offset] != 0x02:
+                  raise ValueError("expected DER INTEGER")
+
+              length, offset = read_der_length(data, offset + 1)
+              end = offset + length
+
+              if length <= 0 or end > len(data):
+                  raise ValueError("invalid DER INTEGER length")
+
+              value = data[offset:end]
+
+              while len(value) > 1 and value[0] == 0:
+                  value = value[1:]
+
+              if len(value) > 32:
+                  raise ValueError("ECDSA integer exceeds P-256 width")
+
+              return value.rjust(32, b"\0"), end
+
+          key_id = os.environ["ASC_KEY_ID"].strip()
+          issuer_id = os.environ["ASC_ISSUER_ID"].strip()
+          key_path = os.environ["ASC_KEY_PATH"]
+
+          if not key_id or not issuer_id:
+              raise SystemExit("missing App Store Connect key ID or issuer ID")
+
+          now = int(time.time())
+
+          header = {
+              "alg": "ES256",
+              "kid": key_id,
+              "typ": "JWT",
+          }
+
+          payload = {
+              "iss": issuer_id,
+              "iat": now - 5,
+              "exp": now + 300,
+              "aud": "appstoreconnect-v1",
+          }
+
+          encoded_header = b64url(
+              json.dumps(
+                  header,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+          )
+
+          encoded_payload = b64url(
+              json.dumps(
+                  payload,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+          )
+
+          signing_input = (
+              f"{encoded_header}.{encoded_payload}"
+          ).encode("ascii")
+
+          result = subprocess.run(
+              [
+                  "openssl",
+                  "dgst",
+                  "-sha256",
+                  "-sign",
+                  key_path,
+              ],
+              input=signing_input,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              check=False,
+          )
+
+          if result.returncode != 0:
+              sys.stderr.write(
+                  result.stderr.decode(
+                      "utf-8",
+                      errors="replace",
+                  )
+              )
+              raise SystemExit(
+                  "OpenSSL could not sign the App Store Connect JWT"
+              )
+
+          der = result.stdout
+
+          if not der or der[0] != 0x30:
+              raise SystemExit(
+                  "OpenSSL returned an invalid ECDSA signature"
+              )
+
+          sequence_length, offset = read_der_length(der, 1)
+          sequence_end = offset + sequence_length
+
+          if sequence_end != len(der):
+              raise SystemExit(
+                  "Unexpected bytes in ECDSA signature"
+              )
+
+          r_value, offset = read_der_integer(der, offset)
+          s_value, offset = read_der_integer(der, offset)
+
+          if offset != sequence_end:
+              raise SystemExit(
+                  "Unexpected ECDSA signature structure"
+              )
+
+          signature = b64url(r_value + s_value)
+
+          print(
+              f"{signing_input.decode('ascii')}.{signature}"
+          )
+          PY
+
+          chmod 600 "$token_path"
+
+          if [[ ! -s "$token_path" ]]; then
+            echo "::error::Could not create the App Store Connect JWT."
             exit 1
           fi
+
+          asc_token="$(cat "$token_path")"
+
+          set +e
+          http_code="$(
+            curl \
+              --silent \
+              --show-error \
+              --connect-timeout 15 \
+              --max-time 45 \
+              --retry 2 \
+              --retry-delay 2 \
+              --output "$response_path" \
+              --write-out '%{http_code}' \
+              --get \
+              --header "Authorization: Bearer $asc_token" \
+              --header "Accept: application/json" \
+              --data-urlencode "filter[identifier]=$EXPECTED_BUNDLE_ID" \
+              --data-urlencode "filter[platform]=IOS" \
+              --data-urlencode "fields[bundleIds]=identifier" \
+              --data-urlencode "limit=1" \
+              "https://api.appstoreconnect.apple.com/v1/bundleIds" \
+              2> "$curl_log"
+          )"
+          curl_status=$?
+          set -e
+
+          rm -f "$token_path"
+          trap - EXIT
+
+          if [[ "$curl_status" -ne 0 ]]; then
+            echo "::error::Could not contact the App Store Connect API."
+            tail -80 "$curl_log" || true
+            exit 1
+          fi
+
+          if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::App Store Connect authentication failed with HTTP $http_code."
+            echo "::error::Verify ASC_KEY_ID, ASC_ISSUER_ID, ASC_PRIVATE_KEY_BASE64, and key permissions."
+            cat "$response_path" || true
+            exit 1
+          fi
+
+          export ASC_AUTH_RESPONSE_PATH="$response_path"
+          export EXPECTED_BUNDLE_ID
+
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          response_path = Path(
+              os.environ["ASC_AUTH_RESPONSE_PATH"]
+          )
+          expected = os.environ["EXPECTED_BUNDLE_ID"]
+
+          try:
+              payload = json.loads(
+                  response_path.read_text(
+                      encoding="utf-8"
+                  )
+              )
+          except Exception as exc:
+              print(
+                  "::error::App Store Connect returned invalid JSON: "
+                  f"{exc}"
+              )
+              sys.exit(1)
+
+          resources = payload.get("data")
+
+          if not isinstance(resources, list):
+              print(
+                  "::error::App Store Connect returned an unexpected response."
+              )
+              sys.exit(1)
+
+          identifiers = []
+
+          for resource in resources:
+              if not isinstance(resource, dict):
+                  continue
+
+              attributes = resource.get("attributes")
+
+              if isinstance(attributes, dict):
+                  identifier = attributes.get("identifier")
+
+                  if isinstance(identifier, str):
+                      identifiers.append(identifier)
+
+          if expected not in identifiers:
+              print(
+                  "::error::The API key authenticated, but it cannot access "
+                  f"bundle ID {expected!r}."
+              )
+              sys.exit(1)
+
+          print(
+              "[OK] App Store Connect API authentication and bundle-ID "
+              "access confirmed."
+          )
+          PY
 
           ended_at="$(date +%s)"
           duration="$((ended_at - started_at))"
